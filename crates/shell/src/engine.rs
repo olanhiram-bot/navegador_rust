@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
@@ -846,11 +846,27 @@ async fn handle_frame(state: &mut State, tab: TabId, event: &Value, events: &Emi
         .and_then(Value::as_f64)
         .unwrap_or(768.0);
 
-    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data)
-        && let Ok(image) = image::load_from_memory(&bytes)
-    {
-        let rgba = image.to_rgba8();
+    // Decodificar un JPEG de varios megapíxeles es CPU pura: lo sacamos del
+    // hilo async para no retrasar comandos mientras llega el siguiente frame.
+    let started = Instant::now();
+    let encoded_bytes = data.len();
+    let encoded = data.to_string();
+    let decoded = tokio::task::spawn_blocking(move || {
+        let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)?;
+        let image = image::load_from_memory(&bytes)?;
+        Ok::<_, anyhow::Error>(image.to_rgba8())
+    })
+    .await;
+
+    if let Ok(Ok(rgba)) = decoded {
         let (width, height) = rgba.dimensions();
+        if std::env::var_os("NAVEGADOR_FRAME_LOG").is_some() {
+            eprintln!(
+                "frame {width}x{height} jpeg={} KB decode={:?}",
+                encoded_bytes / 1024,
+                started.elapsed()
+            );
+        }
         let _ = events.emit(Event::Frame {
             tab,
             frame: Frame {

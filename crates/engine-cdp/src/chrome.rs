@@ -337,9 +337,11 @@ impl Chrome {
                 "Page.startScreencast",
                 json!({
                     "format": "jpeg",
-                    // 95 y sin tope: los frames salen al tamaño real del viewport
-                    // (x deviceScaleFactor), y la UI los reduce con mipmaps.
-                    "quality": 95,
+                    // 80 + tope: calidad suficiente para leer texto y frames
+                    // manejables para decodificar a 30 fps sin bloquear el motor.
+                    "quality": 80,
+                    "maxWidth": 1600,
+                    "maxHeight": 1000,
                     "everyNthFrame": 1,
                 }),
             )

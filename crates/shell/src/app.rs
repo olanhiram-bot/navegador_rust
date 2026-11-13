@@ -658,8 +658,10 @@ impl ShellApp {
         // Nitidez sin reventar memoria: si el viewport a escala 2 supera el
         // presupuesto de píxeles, bajamos el deviceScaleFactor. Cada frame
         // RGBA cuesta width*height*4 y se nota en la fluidez.
-        let mut scale = ui.ctx().pixels_per_point();
-        const BUDGET: f32 = 7_000_000.0;
+        // Por encima de 1.75 el coste por frame crece más rápido que la nitidez
+        // que aporta; el texto se sigue leyendo bien con mipmaps.
+        let mut scale = ui.ctx().pixels_per_point().min(1.75);
+        const BUDGET: f32 = 4_500_000.0;
         if target.x * target.y * scale * scale > BUDGET {
             scale = (BUDGET / (target.x * target.y)).sqrt().clamp(1.0, scale);
         }

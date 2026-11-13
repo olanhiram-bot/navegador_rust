@@ -44,8 +44,11 @@ hilo egui (eframe)              hilo motor (tokio)
   dropee las sesiones, que matan sus grupos de procesos.
 - El motor despierta a la UI con `request_repaint` cuando emite un evento y la
   UI descarta los frames viejos: solo aplica el último de cada lote.
-- El `deviceScaleFactor` se recorta si el viewport supera 7 Mpx para que un
-  frame RGBA no dispare la latencia.
+- El screencast va a JPEG 80 con tope 1600×1000; el `deviceScaleFactor` se
+  limita a 1.75 y a un presupuesto de 4.5 Mpx.
+- La decodificación JPEG corre en `spawn_blocking`, y `image`, `zune-jpeg` y
+  `base64` se compilan con `opt-level = 3` también en `dev` (sin eso, un frame
+  tardaba ~150 ms y la navegación se sentía rota).
 
 ## Actuar sin reenviar el click
 

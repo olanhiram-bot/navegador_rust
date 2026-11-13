@@ -17,6 +17,17 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 
+# La decodificación JPEG es el trabajo por frame más caro de la shell. Sin
+# esto, en `dev` tarda ~150 ms por frame y la navegación se siente rota.
+[profile.dev.package.image]
+opt-level = 3
+
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+
+[profile.dev.package.base64]
+opt-level = 3
+
 [workspace.dependencies]
 anyhow = "1"
 base64 = "0.22"
