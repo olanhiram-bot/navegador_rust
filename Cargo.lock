@@ -107,6 +107,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "base64"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
 name = "bit-set"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -687,11 +693,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "engine-cdp"
+name = "engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "descriptor",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "engine-cdp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "descriptor",
+ "engine",
  "futures-util",
  "libc",
  "serde_json",
@@ -1466,6 +1485,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
+name = "mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "card",
+ "engine-cdp",
+ "navegador",
+ "receipt",
+ "serde_json",
+ "session",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2221,6 +2256,7 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
+ "sha2",
  "signature",
  "thiserror 2.0.21",
 ]
@@ -2391,6 +2427,23 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "session"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "card",
+ "descriptor",
+ "engine",
+ "receipt",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "url",
 ]
 
 [[package]]

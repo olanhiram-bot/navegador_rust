@@ -227,7 +227,7 @@ impl Chrome {
 
     pub async fn read_text(&mut self) -> Result<String> {
         let text = self
-            .evaluate_isolated("document.body ? document.body.innerText : ''")
+            .evaluate_isolated("JSON.stringify(document.body ? document.body.innerText : '')")
             .await?;
         let value: Value =
             serde_json::from_str(&text).context("el texto de la página no es JSON")?;
