@@ -1,0 +1,17 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: browser-actions/setup-chrome@v1
+      - name: Apuntar al Chromium instalado
+        run: echo "NAVEGADOR_CHROME=$(which google-chrome)" >> "$GITHUB_ENV"
+      - name: Tests (incluye el arnés de ataques)
+        run: cargo test --workspace --all-targets

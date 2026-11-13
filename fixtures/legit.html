@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="es">
+<head><meta charset="utf-8"><title>Transferencia</title></head>
+<body>
+  <h1>Transferencia</h1>
+  <p id="summary">Transferencia a Ana por $1.00</p>
+  <form id="f" action="{{PAGE}}/pay" method="POST">
+    <input name="to" type="hidden" value="ana">
+    <input name="amount" type="hidden" value="1.00">
+    <button id="go" type="submit">Confirmar transferencia de $1.00 a Ana</button>
+  </form>
+</body>
+</html>
