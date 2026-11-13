@@ -169,6 +169,67 @@ impl Chrome {
             .map(str::to_string))
     }
 
+    /// URL absoluta del enlace que corresponde a un selector, si lo hay.
+    pub async fn link_href(&self, selector: &str) -> Result<Option<String>> {
+        let selector = serde_json::to_string(selector).context("serializar el selector")?;
+        let expression = format!(
+            "(function(s){{const el=document.querySelector(s); if(!el) return null; \
+             const a=el.closest('a[href]'); return a ? a.href : null;}})({selector})"
+        );
+        let text = self.evaluate_isolated(&expression).await?;
+        let value: Value = serde_json::from_str(&text).context("JSON de enlace inválido")?;
+        Ok(value.as_str().map(str::to_string))
+    }
+
+    /// Texto compuesto por el teclado (respeta la distribución activa).
+    pub async fn insert_text(&self, text: &str) -> Result<()> {
+        self.cdp
+            .call("Input.insertText", json!({ "text": text }))
+            .await?;
+        Ok(())
+    }
+
+    /// Tecla especial (Enter, Backspace, flechas…). El texto imprimible va por
+    /// `insert_text`; aquí solo se despacha down + up.
+    pub async fn key(&self, key: &str, code: &str, virtual_key: i64, modifiers: u32) -> Result<()> {
+        for event_type in ["keyDown", "keyUp"] {
+            self.cdp
+                .call(
+                    "Input.dispatchKeyEvent",
+                    json!({
+                        "type": event_type,
+                        "key": key,
+                        "code": code,
+                        "windowsVirtualKeyCode": virtual_key,
+                        "nativeVirtualKeyCode": virtual_key,
+                        "modifiers": modifiers,
+                    }),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Click real, solo para enfocar campos de texto y desplegables. Los
+    /// botones nunca pasan por aquí: van por descriptor → tarjeta → recibo.
+    pub async fn click_at(&self, x: f64, y: f64) -> Result<()> {
+        for event_type in ["mousePressed", "mouseReleased"] {
+            self.cdp
+                .call(
+                    "Input.dispatchMouseEvent",
+                    json!({
+                        "type": event_type,
+                        "x": x,
+                        "y": y,
+                        "button": "left",
+                        "clickCount": 1,
+                    }),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Foto de los elementos accionables, con refs `@eN` ligadas a `generation`.
     pub async fn snapshot(&mut self, generation: u32) -> Result<Snapshot> {
         let text = self
@@ -276,14 +337,62 @@ impl Chrome {
                 "Page.startScreencast",
                 json!({
                     "format": "jpeg",
-                    "quality": 70,
-                    "maxWidth": 1280,
-                    "maxHeight": 800,
+                    // 95 y sin tope: los frames salen al tamaño real del viewport
+                    // (x deviceScaleFactor), y la UI los reduce con mipmaps.
+                    "quality": 95,
                     "everyNthFrame": 1,
                 }),
             )
             .await?;
         Ok(())
+    }
+
+    /// Ajusta la página al área visible de la shell. `width`/`height` son CSS
+    /// píxeles y `scale` el devicePixelRatio: a 2 el texto llega nítido aunque
+    /// la textura se dibuje más pequeña.
+    pub async fn set_viewport(&self, width: u32, height: u32, scale: f64) -> Result<()> {
+        self.cdp
+            .call(
+                "Emulation.setDeviceMetricsOverride",
+                json!({
+                    "width": width.max(320),
+                    "height": height.max(240),
+                    "deviceScaleFactor": scale.clamp(1.0, 3.0),
+                    "mobile": false,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Navega en el historial de la página. `false` si no hay entrada en esa
+    /// dirección.
+    pub async fn history(&self, delta: i64) -> Result<bool> {
+        let history = self
+            .cdp
+            .call("Page.getNavigationHistory", json!({}))
+            .await?;
+        let current = history
+            .get("currentIndex")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let entry_id = history
+            .get("entries")
+            .and_then(Value::as_array)
+            .and_then(|entries| entries.get((current + delta).max(0) as usize))
+            .and_then(|entry| entry.get("id"))
+            .and_then(Value::as_i64);
+
+        let Some(entry_id) = entry_id else {
+            return Ok(false);
+        };
+        self.cdp
+            .call(
+                "Page.navigateToHistoryEntry",
+                json!({ "entryId": entry_id }),
+            )
+            .await?;
+        Ok(true)
     }
 
     pub async fn stop_screencast(&self) -> Result<()> {
@@ -574,6 +683,44 @@ impl engine::Transport for Chrome {
         session_id: i64,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
         Chrome::ack_screencast_frame(self, session_id)
+    }
+
+    fn set_viewport(
+        &mut self,
+        width: u32,
+        height: u32,
+        scale: f64,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        Chrome::set_viewport(self, width, height, scale)
+    }
+
+    fn history(&mut self, delta: i64) -> impl std::future::Future<Output = Result<bool>> + Send {
+        Chrome::history(self, delta)
+    }
+
+    fn link_href(
+        &mut self,
+        selector: &str,
+    ) -> impl std::future::Future<Output = Result<Option<String>>> + Send {
+        Chrome::link_href(self, selector)
+    }
+
+    fn insert_text(&mut self, text: &str) -> impl std::future::Future<Output = Result<()>> + Send {
+        Chrome::insert_text(self, text)
+    }
+
+    fn key(
+        &mut self,
+        key: &str,
+        code: &str,
+        virtual_key: i64,
+        modifiers: u32,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        Chrome::key(self, key, code, virtual_key, modifiers)
+    }
+
+    fn click_at(&mut self, x: f64, y: f64) -> impl std::future::Future<Output = Result<()>> + Send {
+        Chrome::click_at(self, x, y)
     }
 
     fn scroll(

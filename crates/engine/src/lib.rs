@@ -143,6 +143,38 @@ pub trait Transport {
         session_id: i64,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
 
+    /// Ajusta el viewport de la página al área visible de la shell.
+    fn set_viewport(
+        &mut self,
+        width: u32,
+        height: u32,
+        scale: f64,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
+
+    /// Atrás (`-1`), adelante (`1`). `false` si no hay historial en esa dirección.
+    fn history(&mut self, delta: i64) -> impl Future<Output = anyhow::Result<bool>> + Send;
+
+    /// URL absoluta del enlace bajo un selector, si es un enlace.
+    fn link_href(
+        &mut self,
+        selector: &str,
+    ) -> impl Future<Output = anyhow::Result<Option<String>>> + Send;
+
+    /// Texto compuesto por el teclado; respeta la distribución del sistema.
+    fn insert_text(&mut self, text: &str) -> impl Future<Output = anyhow::Result<()>> + Send;
+
+    /// Tecla especial (Enter, Backspace, flechas…).
+    fn key(
+        &mut self,
+        key: &str,
+        code: &str,
+        virtual_key: i64,
+        modifiers: u32,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
+
+    /// Click real para enfocar un campo; los botones no pasan por aquí.
+    fn click_at(&mut self, x: f64, y: f64) -> impl Future<Output = anyhow::Result<()>> + Send;
+
     fn scroll(
         &mut self,
         x: f64,

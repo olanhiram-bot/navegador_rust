@@ -257,6 +257,11 @@ impl<E: Engine> Session<E> {
         self.generation
     }
 
+    /// URL del snapshot vivo, si lo hay.
+    pub fn url(&self) -> Option<&str> {
+        self.snapshot.as_ref().map(|snapshot| snapshot.url.as_str())
+    }
+
     pub fn log(&self) -> &ReceiptLog {
         &self.log
     }
@@ -485,6 +490,46 @@ impl<E: Engine + Transport> Session<E> {
 
     pub async fn ack_screencast_frame(&mut self, session_id: i64) -> Result<(), SessionError> {
         self.engine.ack_screencast_frame(session_id).await?;
+        Ok(())
+    }
+
+    pub async fn set_viewport(
+        &mut self,
+        width: u32,
+        height: u32,
+        scale: f64,
+    ) -> Result<(), SessionError> {
+        self.engine.set_viewport(width, height, scale).await?;
+        Ok(())
+    }
+
+    pub async fn history(&mut self, delta: i64) -> Result<bool, SessionError> {
+        Ok(self.engine.history(delta).await?)
+    }
+
+    pub async fn link_href(&mut self, selector: &str) -> Result<Option<String>, SessionError> {
+        Ok(self.engine.link_href(selector).await?)
+    }
+
+    pub async fn insert_text(&mut self, text: &str) -> Result<(), SessionError> {
+        self.engine.insert_text(text).await?;
+        Ok(())
+    }
+
+    pub async fn key(
+        &mut self,
+        key: &str,
+        code: &str,
+        virtual_key: i64,
+        modifiers: u32,
+    ) -> Result<(), SessionError> {
+        self.engine.key(key, code, virtual_key, modifiers).await?;
+        Ok(())
+    }
+
+    /// Click de foco para campos de texto; nunca para botones.
+    pub async fn click_at(&mut self, x: f64, y: f64) -> Result<(), SessionError> {
+        self.engine.click_at(x, y).await?;
         Ok(())
     }
 
