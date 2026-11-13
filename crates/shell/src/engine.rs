@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
@@ -82,13 +83,39 @@ pub enum Event {
 }
 
 pub enum Command {
-    NewTab { url: Option<String> },
+    NewTab {
+        url: Option<String>,
+    },
     CloseTab(TabId),
     SelectTab(TabId),
     Navigate(String),
-    Wheel { x: f64, y: f64, delta_y: f64 },
-    Click { x: f64, y: f64 },
-    Approve { hash: String },
+    Back,
+    Forward,
+    Reload,
+    Viewport {
+        width: u32,
+        height: u32,
+        scale: f64,
+    },
+    Wheel {
+        x: f64,
+        y: f64,
+        delta_y: f64,
+    },
+    Click {
+        x: f64,
+        y: f64,
+    },
+    InsertText(String),
+    Key {
+        key: String,
+        code: String,
+        virtual_key: i64,
+        modifiers: u32,
+    },
+    Approve {
+        hash: String,
+    },
     Deny,
     Handoff,
     Shutdown,
@@ -118,12 +145,45 @@ impl EngineHandle {
         let _ = self.commands.send(Command::Navigate(url.into()));
     }
 
+    pub fn back(&self) {
+        let _ = self.commands.send(Command::Back);
+    }
+
+    pub fn forward(&self) {
+        let _ = self.commands.send(Command::Forward);
+    }
+
+    pub fn reload(&self) {
+        let _ = self.commands.send(Command::Reload);
+    }
+
+    pub fn viewport(&self, width: u32, height: u32, scale: f64) {
+        let _ = self.commands.send(Command::Viewport {
+            width,
+            height,
+            scale,
+        });
+    }
+
     pub fn wheel(&self, x: f64, y: f64, delta_y: f64) {
         let _ = self.commands.send(Command::Wheel { x, y, delta_y });
     }
 
     pub fn click(&self, x: f64, y: f64) {
         let _ = self.commands.send(Command::Click { x, y });
+    }
+
+    pub fn insert_text(&self, text: impl Into<String>) {
+        let _ = self.commands.send(Command::InsertText(text.into()));
+    }
+
+    pub fn key(&self, key: &str, code: &str, virtual_key: i64, modifiers: u32) {
+        let _ = self.commands.send(Command::Key {
+            key: key.to_string(),
+            code: code.to_string(),
+            virtual_key,
+            modifiers,
+        });
     }
 
     pub fn approve(&self, hash: impl Into<String>) {
@@ -152,14 +212,41 @@ impl Drop for EngineHandle {
     }
 }
 
+#[derive(Clone)]
+struct Emitter {
+    tx: Sender<Event>,
+    notify: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl Emitter {
+    fn emit(&self, event: Event) {
+        let _ = self.tx.send(event);
+        (self.notify)();
+    }
+}
+
 pub fn spawn(initial_url: String, log_path: PathBuf) -> EngineHandle {
+    spawn_with_notify(initial_url, log_path, Arc::new(|| {}))
+}
+
+/// `notify` despierta a la UI cuando hay un evento nuevo: sin él habría que
+/// repintar a ciegas y se gastaba CPU con la página quieta.
+pub fn spawn_with_notify(
+    initial_url: String,
+    log_path: PathBuf,
+    notify: Arc<dyn Fn() + Send + Sync>,
+) -> EngineHandle {
     let (commands, command_rx) = unbounded_channel();
     let (events_tx, events) = channel();
     let (done_tx, done) = channel();
+    let emitter = Emitter {
+        tx: events_tx,
+        notify,
+    };
 
     std::thread::spawn(move || {
-        if let Err(error) = run(initial_url, log_path, command_rx, events_tx.clone()) {
-            let _ = events_tx.send(Event::Error(format!("{error:#}")));
+        if let Err(error) = run(initial_url, log_path, command_rx, emitter.clone()) {
+            emitter.emit(Event::Error(format!("{error:#}")));
         }
         let _ = done_tx.send(());
     });
@@ -193,7 +280,7 @@ fn run(
     initial_url: String,
     log_path: PathBuf,
     mut commands: UnboundedReceiver<Command>,
-    events: Sender<Event>,
+    events: Emitter,
 ) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -218,7 +305,7 @@ fn run(
                         Ok(false) => {}
                         // Un comando fallido no tumba el motor ni las demás pestañas.
                         Err(error) => {
-                            let _ = events.send(Event::Error(format!("{error:#}")));
+                            let _ = events.emit(Event::Error(format!("{error:#}")));
                         }
                     },
                     Err(TryRecvError::Empty) => break,
@@ -255,11 +342,7 @@ fn run(
 }
 
 /// `true` significa cerrar la shell.
-async fn handle_command(
-    state: &mut State,
-    command: Command,
-    events: &Sender<Event>,
-) -> Result<bool> {
+async fn handle_command(state: &mut State, command: Command, events: &Emitter) -> Result<bool> {
     match command {
         Command::Shutdown => return Ok(true),
         Command::NewTab { url } => {
@@ -268,12 +351,44 @@ async fn handle_command(
         Command::CloseTab(id) => close_tab(state, id, events).await?,
         Command::SelectTab(id) => select_tab(state, id, events).await?,
         Command::Navigate(url) => navigate(state, &url, events).await?,
+        Command::Back => history_move(state, -1, events).await?,
+        Command::Forward => history_move(state, 1, events).await?,
+        Command::Reload => reload(state, events).await?,
+        Command::Viewport {
+            width,
+            height,
+            scale,
+        } => {
+            if let Some(tab) = active_tab(state) {
+                tab.session.set_viewport(width, height, scale).await?;
+            }
+        }
         Command::Wheel { x, y, delta_y } => {
             if let Some(tab) = active_tab(state) {
                 tab.session.scroll(x, y, delta_y).await?;
             }
         }
         Command::Click { x, y } => click(state, x, y, events).await?,
+        Command::InsertText(text) => {
+            if let Some(tab) = active_tab(state) {
+                tab.session.insert_text(&text).await?;
+            }
+        }
+        Command::Key {
+            key,
+            code,
+            virtual_key,
+            modifiers,
+        } => {
+            if let Some(tab) = active_tab(state) {
+                tab.session.key(&key, &code, virtual_key, modifiers).await?;
+            }
+            // Enter puede enviar un formulario; si la URL cambia, refrescamos
+            // snapshot y dirección en vez de quedarnos con el DOM anterior.
+            if key == "Enter" {
+                refresh_after_enter(state, events).await?;
+            }
+        }
         Command::Approve { hash } => approve(state, &hash, events).await?,
         Command::Deny => deny(state, events),
         Command::Handoff => handoff(state, events).await,
@@ -285,7 +400,7 @@ fn active_tab(state: &mut State) -> Option<&mut Tab> {
     state.active.and_then(|id| state.tabs.get_mut(&id))
 }
 
-async fn open_tab(state: &mut State, url: &str, events: &Sender<Event>) -> Result<TabId> {
+async fn open_tab(state: &mut State, url: &str, events: &Emitter) -> Result<TabId> {
     let id = state.next_id;
     state.next_id += 1;
     let log_path = tab_log_path(&state.log_base, id);
@@ -320,9 +435,9 @@ async fn open_tab(state: &mut State, url: &str, events: &Sender<Event>) -> Resul
         },
     );
 
-    let _ = events.send(Event::TabOpened(info));
-    let _ = events.send(Event::Selected(Some(id)));
-    let _ = events.send(Event::Snapshot {
+    let _ = events.emit(Event::TabOpened(info));
+    let _ = events.emit(Event::Selected(Some(id)));
+    let _ = events.emit(Event::Snapshot {
         tab: id,
         info: snapshot_info(&snapshot),
         elements,
@@ -331,11 +446,11 @@ async fn open_tab(state: &mut State, url: &str, events: &Sender<Event>) -> Resul
     Ok(id)
 }
 
-async fn close_tab(state: &mut State, id: TabId, events: &Sender<Event>) -> Result<()> {
+async fn close_tab(state: &mut State, id: TabId, events: &Emitter) -> Result<()> {
     if state.tabs.remove(&id).is_none() {
         return Ok(());
     }
-    let _ = events.send(Event::TabClosed(id));
+    let _ = events.emit(Event::TabClosed(id));
     if state.active != Some(id) {
         return Ok(());
     }
@@ -345,13 +460,13 @@ async fn close_tab(state: &mut State, id: TabId, events: &Sender<Event>) -> Resu
     match next {
         Some(next) => select_tab(state, next, events).await?,
         None => {
-            let _ = events.send(Event::Selected(None));
+            let _ = events.emit(Event::Selected(None));
         }
     }
     Ok(())
 }
 
-async fn select_tab(state: &mut State, id: TabId, events: &Sender<Event>) -> Result<()> {
+async fn select_tab(state: &mut State, id: TabId, events: &Emitter) -> Result<()> {
     if !state.tabs.contains_key(&id) {
         return Ok(());
     }
@@ -375,8 +490,8 @@ async fn select_tab(state: &mut State, id: TabId, events: &Sender<Event>) -> Res
     };
 
     state.active = Some(id);
-    let _ = events.send(Event::Selected(Some(id)));
-    let _ = events.send(Event::Snapshot {
+    let _ = events.emit(Event::Selected(Some(id)));
+    let _ = events.emit(Event::Snapshot {
         tab: id,
         info,
         elements,
@@ -385,7 +500,7 @@ async fn select_tab(state: &mut State, id: TabId, events: &Sender<Event>) -> Res
     Ok(())
 }
 
-async fn navigate(state: &mut State, url: &str, events: &Sender<Event>) -> Result<()> {
+async fn navigate(state: &mut State, url: &str, events: &Emitter) -> Result<()> {
     let Some(id) = state.active else {
         return Ok(());
     };
@@ -398,7 +513,7 @@ async fn navigate(state: &mut State, url: &str, events: &Sender<Event>) -> Resul
         tab.session.start_screencast().await.ok();
         (snapshot_info(&snapshot), snapshot.elements)
     };
-    let _ = events.send(Event::Snapshot {
+    let _ = events.emit(Event::Snapshot {
         tab: id,
         info: info.0,
         elements: info.1,
@@ -407,7 +522,123 @@ async fn navigate(state: &mut State, url: &str, events: &Sender<Event>) -> Resul
     Ok(())
 }
 
-async fn click(state: &mut State, x: f64, y: f64, events: &Sender<Event>) -> Result<()> {
+async fn reload(state: &mut State, events: &Emitter) -> Result<()> {
+    let Some(id) = state.active else {
+        return Ok(());
+    };
+    let url = state
+        .tabs
+        .get(&id)
+        .and_then(|tab| tab.session.url().map(str::to_string));
+    match url {
+        Some(url) => navigate(state, &url, events).await,
+        None => {
+            let _ = events.emit(Event::Notice("no hay una URL que recargar".into()));
+            Ok(())
+        }
+    }
+}
+
+async fn history_move(state: &mut State, delta: i64, events: &Emitter) -> Result<()> {
+    let Some(id) = state.active else {
+        return Ok(());
+    };
+    let (moved, previous) = {
+        let tab = state.tabs.get_mut(&id).expect("pestaña activa");
+        let previous = tab.session.url().map(str::to_string);
+        (tab.session.history(delta).await?, previous)
+    };
+    if !moved {
+        let _ = events.emit(Event::Notice(
+            "no hay más historial en esa dirección".into(),
+        ));
+        return Ok(());
+    }
+    let Some(previous) = previous else {
+        return Ok(());
+    };
+
+    let snapshot = {
+        let tab = state.tabs.get_mut(&id).expect("pestaña activa");
+        wait_for_url_change(&mut tab.session, &previous).await?
+    };
+    if let Some(tab) = state.tabs.get_mut(&id) {
+        tab.pending = None;
+    }
+    let _ = events.emit(Event::Snapshot {
+        tab: id,
+        info: snapshot_info(&snapshot),
+        elements: snapshot.elements,
+    });
+    send_receipts(state, id, events);
+    Ok(())
+}
+
+/// Tras `navigateToHistoryEntry` el DOM tarda en cambiar; no damos por buena
+/// una foto con la URL anterior.
+async fn wait_for_url_change(
+    session: &mut Session<Chrome>,
+    previous: &str,
+) -> Result<engine_cdp::Snapshot> {
+    let mut last: Option<Result<engine_cdp::Snapshot>> = None;
+    for _ in 0..25 {
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        match session.snapshot().await {
+            Ok(snapshot) if snapshot.url != previous => return Ok(snapshot),
+            Ok(snapshot) => last = Some(Ok(snapshot)),
+            Err(error) => last = Some(Err(error.into())),
+        }
+    }
+    match last {
+        Some(Ok(snapshot)) => Ok(snapshot),
+        Some(Err(error)) => Err(error),
+        None => anyhow::bail!("la navegación no terminó"),
+    }
+}
+
+/// Tras Enter, espera a que la navegación cambie la URL. Si no cambia (por
+/// ejemplo, un campo sin formulario) no toca el snapshot vivo.
+async fn refresh_after_enter(state: &mut State, events: &Emitter) -> Result<()> {
+    let Some(id) = state.active else {
+        return Ok(());
+    };
+    let previous = state
+        .tabs
+        .get(&id)
+        .and_then(|tab| tab.session.url().map(str::to_string));
+    let Some(previous) = previous else {
+        return Ok(());
+    };
+
+    for _ in 0..6 {
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let snapshot = {
+            let Some(tab) = state.tabs.get_mut(&id) else {
+                return Ok(());
+            };
+            tab.session.snapshot().await.ok()
+        };
+        let Some(snapshot) = snapshot else {
+            continue;
+        };
+        if snapshot.url == previous {
+            continue;
+        }
+        if let Some(tab) = state.tabs.get_mut(&id) {
+            tab.pending = None;
+        }
+        events.emit(Event::Snapshot {
+            tab: id,
+            info: snapshot_info(&snapshot),
+            elements: snapshot.elements,
+        });
+        send_receipts(state, id, events);
+        return Ok(());
+    }
+    Ok(())
+}
+
+async fn click(state: &mut State, x: f64, y: f64, events: &Emitter) -> Result<()> {
     let Some(id) = state.active else {
         return Ok(());
     };
@@ -419,18 +650,50 @@ async fn click(state: &mut State, x: f64, y: f64, events: &Sender<Event>) -> Res
     };
 
     let Some(element) = element else {
-        let _ = events.send(Event::Notice(
+        let _ = events.emit(Event::Notice(
             "no hay un elemento accionable en ese punto".into(),
         ));
         return Ok(());
     };
 
-    if element.role != "button" {
-        let _ = events.send(Event::Notice(format!(
-            "{} «{}» no es un botón: la shell solo actúa sobre botones por ahora",
-            element.role, element.name
-        )));
-        return Ok(());
+    match element.role.as_str() {
+        "button" => {}
+        "link" => {
+            let href = {
+                let tab = state.tabs.get_mut(&id).expect("pestaña activa");
+                tab.session.link_href(&element.selector).await?
+            };
+            return match href {
+                Some(href) if href.starts_with("http://") || href.starts_with("https://") => {
+                    navigate(state, &href, events).await
+                }
+                _ => {
+                    let _ = events.emit(Event::Notice(format!(
+                        "el enlace «{}» no tiene un destino navegable",
+                        element.name
+                    )));
+                    Ok(())
+                }
+            };
+        }
+        // Un click en un campo no ejecuta nada: solo le da el foco para que el
+        // teclado reenviado escriba ahí.
+        "textbox" | "searchbox" | "combobox" | "select" => {
+            let tab = state.tabs.get_mut(&id).expect("pestaña activa");
+            tab.session.click_at(x, y).await?;
+            let _ = events.emit(Event::Notice(format!(
+                "campo «{}» enfocado · escribe",
+                element.name
+            )));
+            return Ok(());
+        }
+        _ => {
+            let _ = events.emit(Event::Notice(format!(
+                "«{}» es un {}: se puede leer, pero no actuar sin tarjeta",
+                element.name, element.role
+            )));
+            return Ok(());
+        }
     }
 
     let options = ActOptions {
@@ -445,17 +708,17 @@ async fn click(state: &mut State, x: f64, y: f64, events: &Sender<Event>) -> Res
     settle_act(state, id, &element.reference, options, outcome, events).await
 }
 
-async fn approve(state: &mut State, hash: &str, events: &Sender<Event>) -> Result<()> {
+async fn approve(state: &mut State, hash: &str, events: &Emitter) -> Result<()> {
     let Some(id) = state.active else {
         return Ok(());
     };
     let Some(pending) = state.tabs.get_mut(&id).and_then(|tab| tab.pending.take()) else {
-        let _ = events.send(Event::Notice("no hay ninguna aprobación pendiente".into()));
+        let _ = events.emit(Event::Notice("no hay ninguna aprobación pendiente".into()));
         return Ok(());
     };
 
     if pending.options.approved_hash.as_deref() != Some(hash) {
-        let _ = events.send(Event::Notice(
+        let _ = events.emit(Event::Notice(
             "la aprobación no coincide con el hash pendiente".into(),
         ));
         if let Some(tab) = state.tabs.get_mut(&id) {
@@ -481,14 +744,14 @@ async fn approve(state: &mut State, hash: &str, events: &Sender<Event>) -> Resul
     .await
 }
 
-fn deny(state: &mut State, events: &Sender<Event>) {
+fn deny(state: &mut State, events: &Emitter) {
     if let Some(tab) = active_tab(state) {
         tab.pending = None;
     }
-    let _ = events.send(Event::Notice("acción denegada por la persona".into()));
+    let _ = events.emit(Event::Notice("acción denegada por la persona".into()));
 }
 
-async fn handoff(state: &mut State, events: &Sender<Event>) {
+async fn handoff(state: &mut State, events: &Emitter) {
     let Some(id) = state.active else {
         return;
     };
@@ -498,7 +761,7 @@ async fn handoff(state: &mut State, events: &Sender<Event>) {
         };
         tab.session.handoff().await
     };
-    let _ = events.send(Event::Handoff { tab: id, report });
+    let _ = events.emit(Event::Handoff { tab: id, report });
 }
 
 async fn settle_act(
@@ -507,7 +770,7 @@ async fn settle_act(
     reference: &str,
     options: ActOptions,
     outcome: ActOutcome,
-    events: &Sender<Event>,
+    events: &Emitter,
 ) -> Result<()> {
     match &outcome {
         ActOutcome::ApprovalRequired { hash, .. } => {
@@ -531,17 +794,17 @@ async fn settle_act(
         _ => {}
     }
 
-    let _ = events.send(Event::Act { tab: id, outcome });
+    let _ = events.emit(Event::Act { tab: id, outcome });
     Ok(())
 }
 
-async fn refresh_snapshot(state: &mut State, id: TabId, events: &Sender<Event>) -> Result<()> {
+async fn refresh_snapshot(state: &mut State, id: TabId, events: &Emitter) -> Result<()> {
     let Some(tab) = state.tabs.get_mut(&id) else {
         return Ok(());
     };
     // `act` invalidó el snapshot y avanzó la generación.
     let snapshot = tab.session.snapshot().await?;
-    let _ = events.send(Event::Snapshot {
+    let _ = events.emit(Event::Snapshot {
         tab: id,
         info: snapshot_info(&snapshot),
         elements: snapshot.elements,
@@ -549,11 +812,11 @@ async fn refresh_snapshot(state: &mut State, id: TabId, events: &Sender<Event>) 
     Ok(())
 }
 
-fn send_receipts(state: &State, id: TabId, events: &Sender<Event>) {
+fn send_receipts(state: &State, id: TabId, events: &Emitter) {
     let Some(tab) = state.tabs.get(&id) else {
         return;
     };
-    let _ = events.send(Event::Receipts {
+    let _ = events.emit(Event::Receipts {
         tab: id,
         count: tab.session.log().entries().len(),
         last: tab
@@ -565,7 +828,7 @@ fn send_receipts(state: &State, id: TabId, events: &Sender<Event>) {
     });
 }
 
-async fn handle_frame(state: &mut State, tab: TabId, event: &Value, events: &Sender<Event>) {
+async fn handle_frame(state: &mut State, tab: TabId, event: &Value, events: &Emitter) {
     let params = &event["params"];
     let Some(session_id) = params.get("sessionId").and_then(Value::as_i64) else {
         return;
@@ -588,7 +851,7 @@ async fn handle_frame(state: &mut State, tab: TabId, event: &Value, events: &Sen
     {
         let rgba = image.to_rgba8();
         let (width, height) = rgba.dimensions();
-        let _ = events.send(Event::Frame {
+        let _ = events.emit(Event::Frame {
             tab,
             frame: Frame {
                 width: width as usize,

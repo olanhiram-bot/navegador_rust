@@ -149,6 +149,46 @@ fn click_sobre_un_boton_pasa_por_tarjeta_y_recibo() {
 }
 
 #[test]
+fn atras_y_adelante_recorren_el_historial() {
+    let server = navegador::FixtureServer::start();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let handle = spawn(
+        server.page_url("shop.html"),
+        dir.path().join("recibos.jsonl"),
+    );
+    let (tab, _) = first_snapshot(&handle);
+
+    handle.navigate(server.page_url("settings.html"));
+    match wait_for(&handle, 20, |event| {
+        matches!(event, Event::Snapshot { tab: t, info, .. }
+            if *t == tab && info.url.ends_with("settings.html"))
+    }) {
+        Event::Snapshot { info, .. } => assert!(info.url.ends_with("settings.html")),
+        _ => unreachable!(),
+    }
+
+    handle.back();
+    match wait_for(&handle, 20, |event| {
+        matches!(event, Event::Snapshot { tab: t, info, .. }
+            if *t == tab && info.url.ends_with("shop.html"))
+    }) {
+        Event::Snapshot { info, .. } => assert!(info.url.ends_with("shop.html")),
+        _ => unreachable!(),
+    }
+
+    handle.forward();
+    match wait_for(&handle, 20, |event| {
+        matches!(event, Event::Snapshot { tab: t, info, .. }
+            if *t == tab && info.url.ends_with("settings.html"))
+    }) {
+        Event::Snapshot { info, .. } => assert!(info.url.ends_with("settings.html")),
+        _ => unreachable!(),
+    }
+
+    handle.shutdown();
+}
+
+#[test]
 fn las_pestanas_comparten_ventana_y_se_pueden_cerrar() {
     let server = navegador::FixtureServer::start();
     let dir = tempfile::tempdir().expect("tempdir");

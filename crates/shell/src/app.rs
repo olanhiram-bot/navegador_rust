@@ -1,15 +1,25 @@
-//! UI de la shell: pestañas, página, tarjeta y panel del agente.
+//! UI de la shell: pestañas, barra de navegador, página, tarjeta y agente.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use card::CardView;
 use eframe::egui;
-use egui::{Align2, Color32, Rect, Sense, Vec2};
+use egui::{Align, Color32, Layout, Rect, Sense, Vec2};
 use engine_cdp::ElementRef;
 use session::{ActOutcome, Handoff};
 
 use crate::engine::{EngineHandle, Event, TabId, TabInfo};
+
+const CHROME: Color32 = Color32::from_rgb(17, 18, 21);
+const TAB_ACTIVE: Color32 = Color32::from_rgb(45, 47, 54);
+const TAB_IDLE: Color32 = Color32::from_rgb(29, 30, 35);
+const OMNI: Color32 = Color32::from_rgb(38, 40, 47);
+const PAGE_BG: Color32 = Color32::from_rgb(12, 13, 15);
+const ACCENT: Color32 = Color32::from_rgb(124, 158, 255);
+const MUTED: Color32 = Color32::from_rgb(154, 158, 170);
+const DANGER: Color32 = Color32::from_rgb(255, 128, 128);
 
 struct TabFrame {
     texture: egui::TextureHandle,
@@ -44,12 +54,31 @@ pub struct ShellApp {
     receipts: Receipts,
     elements: Vec<ElementRef>,
     generation: u32,
+    last_viewport: (Vec2, f32),
 }
 
 impl ShellApp {
-    pub fn new(initial_url: String, log_path: PathBuf, _cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(initial_url: String, log_path: PathBuf, cc: &eframe::CreationContext<'_>) -> Self {
+        let ctx = &cc.egui_ctx;
+        let mut visuals = egui::Visuals::dark();
+        visuals.panel_fill = CHROME;
+        visuals.window_fill = Color32::from_rgb(32, 34, 40);
+        visuals.extreme_bg_color = Color32::from_rgb(15, 16, 19);
+        visuals.selection.bg_fill = Color32::from_rgb(58, 84, 150);
+        ctx.set_visuals(visuals);
+
+        let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
+        style.spacing.item_spacing = egui::vec2(6.0, 6.0);
+        style.spacing.button_padding = egui::vec2(9.0, 4.0);
+        ctx.set_style_of(egui::Theme::Dark, style);
+
+        let repaint_ctx = ctx.clone();
         ShellApp {
-            handle: crate::engine::spawn(initial_url.clone(), log_path),
+            handle: crate::engine::spawn_with_notify(
+                initial_url.clone(),
+                log_path,
+                Arc::new(move || repaint_ctx.request_repaint()),
+            ),
             tabs: Vec::new(),
             active: None,
             address: initial_url,
@@ -63,34 +92,19 @@ impl ShellApp {
             receipts: Receipts::default(),
             elements: Vec::new(),
             generation: 0,
+            last_viewport: (Vec2::ZERO, 0.0),
         }
     }
 
     fn drain_events(&mut self, ctx: &egui::Context) {
+        // Si llegan varios frames entre repintados, solo sirve el último: pintar
+        // todos es trabajo perdido y se nota como tirones al hacer scroll.
+        let mut latest_frame = None;
         while let Ok(event) = self.handle.events.try_recv() {
             match event {
                 Event::Frame { tab, frame } => {
-                    if Some(tab) != self.active {
-                        continue;
-                    }
-                    let image = egui::ColorImage::from_rgba_unmultiplied(
-                        [frame.width, frame.height],
-                        &frame.rgba,
-                    );
-                    let css = Vec2::new(frame.css_width as f32, frame.css_height as f32);
-                    match self.frames.get_mut(&tab) {
-                        Some(existing) => {
-                            existing.texture.set(image, egui::TextureOptions::LINEAR);
-                            existing.css = css;
-                        }
-                        None => {
-                            let texture = ctx.load_texture(
-                                format!("página-{tab}"),
-                                image,
-                                egui::TextureOptions::LINEAR,
-                            );
-                            self.frames.insert(tab, TabFrame { texture, css });
-                        }
+                    if Some(tab) == self.active {
+                        latest_frame = Some((tab, frame));
                     }
                 }
                 Event::TabOpened(info) => {
@@ -200,10 +214,30 @@ impl ShellApp {
                 Event::Error(error) => self.status = format!("error: {error}"),
             }
         }
+
+        if let Some((tab, frame)) = latest_frame {
+            self.apply_frame(ctx, tab, frame);
+        }
+    }
+
+    fn apply_frame(&mut self, ctx: &egui::Context, tab: TabId, frame: crate::engine::Frame) {
+        let image =
+            egui::ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &frame.rgba);
+        let css = Vec2::new(frame.css_width as f32, frame.css_height as f32);
+        match self.frames.get_mut(&tab) {
+            Some(existing) => {
+                existing.texture.set(image, texture_options());
+                existing.css = css;
+            }
+            None => {
+                let texture = ctx.load_texture(format!("página-{tab}"), image, texture_options());
+                self.frames.insert(tab, TabFrame { texture, css });
+            }
+        }
     }
 
     fn navigate(&mut self) {
-        let url = normalize_url(&self.address);
+        let url = browser_url(&self.address);
         self.address = url.clone();
         self.status = format!("navegando a {url}…");
         self.handle.navigate(url);
@@ -211,43 +245,213 @@ impl ShellApp {
 
     fn tab_strip(&mut self, ui: &mut egui::Ui) {
         let tabs = self.tabs.clone();
-        for tab in &tabs {
-            let selected = Some(tab.id) == self.active;
-            if ui.selectable_label(selected, display_title(tab)).clicked() {
-                self.handle.select_tab(tab.id);
+        let mut select = None;
+        let mut close = None;
+        let mut open = false;
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for tab in &tabs {
+                let selected = Some(tab.id) == self.active;
+                let fill = if selected { TAB_ACTIVE } else { TAB_IDLE };
+                let text_color = if selected { Color32::WHITE } else { MUTED };
+                let tab_rect = egui::Frame::new()
+                    .fill(fill)
+                    .corner_radius(egui::CornerRadius {
+                        nw: 8,
+                        ne: 8,
+                        sw: 0,
+                        se: 0,
+                    })
+                    .inner_margin(egui::Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let (dot, _) =
+                                ui.allocate_exact_size(egui::vec2(8.0, 8.0), Sense::hover());
+                            ui.painter().circle_filled(
+                                dot.center(),
+                                3.2,
+                                if selected {
+                                    ACCENT
+                                } else {
+                                    Color32::from_gray(105)
+                                },
+                            );
+                            let title = truncate(&display_title(tab), 26);
+                            let label = ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(title).size(12.5).color(text_color),
+                                )
+                                .sense(Sense::click()),
+                            );
+                            if label.clicked() {
+                                select = Some(tab.id);
+                            }
+                            if selected {
+                                let x = ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new("×").size(13.0).color(MUTED),
+                                    )
+                                    .sense(Sense::click()),
+                                );
+                                if x.clicked() {
+                                    close = Some(tab.id);
+                                }
+                            }
+                        });
+                    })
+                    .response
+                    .rect;
+                if selected {
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(tab_rect.left() + 7.0, tab_rect.bottom()),
+                            egui::pos2(tab_rect.right() - 7.0, tab_rect.bottom()),
+                        ],
+                        egui::Stroke::new(2.0, ACCENT),
+                    );
+                }
             }
-            if selected && ui.small_button("×").clicked() {
-                self.handle.close_tab(tab.id);
+            if ui
+                .add(
+                    egui::Button::new(egui::RichText::new("+").size(16.0).color(MUTED))
+                        .frame(false),
+                )
+                .on_hover_text("Nueva pestaña")
+                .clicked()
+            {
+                open = true;
             }
+        });
+
+        if let Some(id) = select {
+            self.handle.select_tab(id);
         }
-        if ui.button("+").clicked() {
+        if let Some(id) = close {
+            self.handle.close_tab(id);
+        }
+        if open {
             self.status = "abriendo pestaña…".to_string();
             self.handle.new_tab(None);
         }
     }
 
-    fn agent_panel(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(6.0);
+    fn toolbar(&mut self, ui: &mut egui::Ui) {
+        let mut back = false;
+        let mut forward = false;
+        let mut reload = false;
+        let mut submit = false;
+
         ui.horizontal(|ui| {
-            ui.heading("Agente");
+            back = nav_button(ui, NavIcon::Back, "Atrás");
+            forward = nav_button(ui, NavIcon::Forward, "Adelante");
+            reload = nav_button(ui, NavIcon::Reload, "Recargar");
+            ui.add_space(4.0);
+
+            let omni_width = (ui.available_width() - 88.0).max(180.0);
+            egui::Frame::new()
+                .fill(OMNI)
+                .corner_radius(15.0)
+                .inner_margin(egui::Margin::symmetric(12, 5))
+                .show(ui, |ui| {
+                    ui.set_width((omni_width - 26.0).max(120.0));
+                    ui.horizontal(|ui| {
+                        security_glyph(ui, &self.address);
+                        let field = ui.add(
+                            egui::TextEdit::singleline(&mut self.address)
+                                .frame(egui::Frame::NONE)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("Escribe una dirección"),
+                        );
+                        if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            submit = true;
+                        }
+                    });
+                });
+
+            if ui
+                .selectable_label(self.agent_open, egui::RichText::new("Agente").size(12.0))
+                .on_hover_text("Panel del agente")
+                .clicked()
+            {
+                self.agent_open = !self.agent_open;
+            }
+        });
+
+        if back {
+            self.handle.back();
+        }
+        if forward {
+            self.handle.forward();
+        }
+        if reload {
+            self.handle.reload();
+        }
+        if submit {
+            self.navigate();
+        }
+    }
+
+    fn status_bar(&self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let color = if self.status.starts_with("error") {
+                DANGER
+            } else {
+                MUTED
+            };
+            ui.add(
+                egui::Label::new(egui::RichText::new(&self.status).size(11.5).color(color))
+                    .truncate(),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} refs · generación {}",
+                        self.elements.len(),
+                        self.generation
+                    ))
+                    .size(11.0)
+                    .color(MUTED),
+                );
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(if self.agent_control {
+                        "control: agente"
+                    } else {
+                        "control: persona"
+                    })
+                    .size(11.0)
+                    .color(if self.agent_control { ACCENT } else { MUTED }),
+                );
+            });
+        });
+    }
+
+    fn agent_panel(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.heading(egui::RichText::new("Agente").size(17.0));
             ui.label(
                 egui::RichText::new(if self.agent_control {
-                    "control: agente"
+                    "conectado (MCP)"
                 } else {
-                    "control: persona"
+                    "en espera"
                 })
-                .size(12.0)
-                .weak(),
+                .size(11.0)
+                .color(if self.agent_control { ACCENT } else { MUTED }),
             );
         });
         ui.separator();
 
         if ui
-            .button(if self.agent_control {
-                "Recuperar control"
-            } else {
-                "Ceder control"
-            })
+            .add_sized(
+                [ui.available_width(), 28.0],
+                egui::Button::new(egui::RichText::new(if self.agent_control {
+                    "Recuperar control"
+                } else {
+                    "Ceder control"
+                })),
+            )
             .clicked()
         {
             if self.agent_control {
@@ -263,42 +467,53 @@ impl ShellApp {
         if self.agent_control {
             ui.label(
                 egui::RichText::new(
-                    "La shell no acepta clicks mientras el agente conduce. Las acciones del \
-                     agente pasan por MCP, su tarjeta y su recibo.",
+                    "La shell no acepta clicks mientras el agente conduce. Sus acciones pasan \
+                     por MCP, su tarjeta y su recibo.",
                 )
-                .size(12.0),
+                .size(11.5)
+                .color(MUTED),
             );
         }
-        ui.add_space(6.0);
 
-        ui.label(egui::RichText::new("Recibos de esta pestaña").strong());
-        ui.label(format!(
-            "{} · último {}",
-            self.receipts.count,
-            self.receipts.last.as_deref().map(short_hash).unwrap_or("—")
-        ));
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("Recibos").strong().size(12.0));
+        ui.label(
+            egui::RichText::new(format!(
+                "{} · último {}",
+                self.receipts.count,
+                self.receipts.last.as_deref().map(short_hash).unwrap_or("—")
+            ))
+            .size(11.5),
+        );
         if let Some(log) = &self.receipts.log {
             ui.label(
                 egui::RichText::new(log.display().to_string())
                     .monospace()
-                    .size(10.0)
-                    .weak(),
+                    .size(9.5)
+                    .color(MUTED),
             );
         }
+
         ui.add_space(6.0);
+        ui.label(egui::RichText::new("Refs vivas").strong().size(12.0));
         ui.label(
             egui::RichText::new(format!(
-                "generación {} · {} refs vivas",
-                self.generation,
-                self.elements.len()
+                "{} elementos · generación {}",
+                self.elements.len(),
+                self.generation
             ))
-            .size(12.0),
+            .size(11.0)
+            .color(MUTED),
         );
         if self.elements.is_empty() {
-            ui.label(egui::RichText::new("sin snapshot vivo").weak().size(12.0));
+            ui.label(
+                egui::RichText::new("sin snapshot vivo")
+                    .color(MUTED)
+                    .size(11.0),
+            );
         } else {
             egui::ScrollArea::vertical()
-                .max_height(180.0)
+                .max_height(170.0)
                 .id_salt("refs")
                 .show(ui, |ui| {
                     for element in self.elements.iter().take(24) {
@@ -308,24 +523,24 @@ impl ShellApp {
                                 element.reference, element.role, element.name
                             ))
                             .monospace()
-                            .size(11.0),
+                            .size(10.5),
                         );
                     }
                 });
         }
 
         ui.separator();
-        ui.label(egui::RichText::new("Handoff").strong());
+        ui.label(egui::RichText::new("Handoff").strong().size(12.0));
         match &self.handoff {
             Some(report) => {
                 egui::ScrollArea::vertical()
                     .id_salt("handoff")
-                    .max_height(220.0)
+                    .max_height(200.0)
                     .show(ui, |ui| {
                         ui.label(
                             egui::RichText::new(report.render_text())
                                 .monospace()
-                                .size(11.0),
+                                .size(10.5),
                         );
                     });
             }
@@ -334,8 +549,8 @@ impl ShellApp {
                     egui::RichText::new(
                         "Cede el control para generar el informe que recibe el agente.",
                     )
-                    .size(12.0)
-                    .weak(),
+                    .size(11.0)
+                    .color(MUTED),
                 );
             }
         }
@@ -351,40 +566,46 @@ impl ShellApp {
         egui::Window::new(pending.card.title.clone())
             .collapsible(false)
             .resizable(false)
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.set_max_width(460.0);
                 for row in &pending.card.rows {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(&row.label).strong().size(12.0));
                         if row.emphasis {
-                            ui.label(
-                                egui::RichText::new(&row.value)
-                                    .color(Color32::LIGHT_RED)
-                                    .strong(),
-                            );
+                            ui.label(egui::RichText::new(&row.value).color(DANGER).strong());
                         } else {
                             ui.label(&row.value);
                         }
                     });
                 }
                 for warning in &pending.card.warnings {
-                    ui.label(egui::RichText::new(format!("⚠ {warning}")).color(Color32::LIGHT_RED));
+                    ui.label(egui::RichText::new(format!("⚠ {warning}")).color(DANGER));
                 }
                 ui.separator();
                 ui.label(
                     egui::RichText::new(format!("hash {}", short_hash(&pending.hash)))
                         .monospace()
                         .size(10.0)
-                        .weak(),
+                        .color(MUTED),
                 );
-                ui.add_space(4.0);
+                ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if ui.button("Denegar").clicked() {
                         deny = true;
                     }
-                    if pending.card.approve_hash.is_some() && ui.button("Aprobar").clicked() {
-                        approve = true;
+                    if pending.card.approve_hash.is_some() {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("Aprobar").color(Color32::WHITE),
+                                )
+                                .fill(ACCENT),
+                            )
+                            .clicked()
+                        {
+                            approve = true;
+                        }
                     }
                 });
             });
@@ -406,7 +627,7 @@ impl ShellApp {
         egui::Window::new("Resultado")
             .collapsible(false)
             .resizable(false)
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.set_max_width(520.0);
                 egui::ScrollArea::vertical()
@@ -424,18 +645,45 @@ impl ShellApp {
     fn page(&mut self, ui: &mut egui::Ui) {
         let Some(tab) = self.active else {
             ui.centered_and_justified(|ui| {
-                ui.label("sin pestañas: pulsa + para abrir una");
+                ui.label(egui::RichText::new("sin pestañas: pulsa + para abrir una").color(MUTED));
             });
             return;
         };
+
+        let available = ui.available_size();
+        let target = egui::vec2(
+            (available.x - 24.0).max(320.0),
+            (available.y - 20.0).max(200.0),
+        );
+        // Nitidez sin reventar memoria: si el viewport a escala 2 supera el
+        // presupuesto de píxeles, bajamos el deviceScaleFactor. Cada frame
+        // RGBA cuesta width*height*4 y se nota en la fluidez.
+        let mut scale = ui.ctx().pixels_per_point();
+        const BUDGET: f32 = 7_000_000.0;
+        if target.x * target.y * scale * scale > BUDGET {
+            scale = (BUDGET / (target.x * target.y)).sqrt().clamp(1.0, scale);
+        }
+        if (target - self.last_viewport.0).length() > 2.0
+            || (scale - self.last_viewport.1).abs() > 0.01
+        {
+            self.last_viewport = (target, scale);
+            self.handle.viewport(
+                target.x.round() as u32,
+                target.y.round() as u32,
+                scale as f64,
+            );
+        }
+
         let Some(frame) = self.frames.get(&tab) else {
-            ui.centered_and_justified(|ui| ui.label("esperando el primer frame…"));
+            ui.centered_and_justified(|ui| {
+                ui.label(egui::RichText::new("cargando la página…").color(MUTED));
+            });
             return;
         };
 
         let css = frame.css;
         let aspect = (css.x / css.y).max(0.1);
-        let mut size = ui.available_size();
+        let mut size = target;
         if size.x / size.y > aspect {
             size.x = size.y * aspect;
         } else {
@@ -445,6 +693,8 @@ impl ShellApp {
         let texture = frame.texture.id();
         ui.vertical_centered(|ui| {
             let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+            ui.painter()
+                .rect_filled(rect.expand(1.0), 0.0, Color32::from_gray(46));
             ui.painter().image(
                 texture,
                 rect,
@@ -466,6 +716,7 @@ impl ShellApp {
             if response.clicked()
                 && let Some(pointer) = response.interact_pointer_pos()
             {
+                response.request_focus();
                 if self.pending.is_some() {
                     self.status = "resuelve la tarjeta antes de seguir actuando".into();
                 } else if self.agent_control {
@@ -478,7 +729,41 @@ impl ShellApp {
                     self.handle.click(x, y);
                 }
             }
+
+            if response.has_focus() {
+                self.forward_keyboard(ui);
+            }
         });
+    }
+
+    /// Reenvía lo tecleado a la página. El texto va como `insertText` (respeta
+    /// la distribución del teclado) y las teclas especiales como keyDown/Up.
+    fn forward_keyboard(&mut self, ui: &egui::Ui) {
+        if self.pending.is_some() || self.agent_control {
+            return;
+        }
+        let events = ui.input(|input| input.events.clone());
+        for event in events {
+            match event {
+                egui::Event::Text(text) | egui::Event::Paste(text) => {
+                    if !text.is_empty() {
+                        self.handle.insert_text(text);
+                    }
+                }
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => {
+                    if let Some((name, code, virtual_key)) = special_key(key) {
+                        self.handle
+                            .key(name, code, virtual_key, cdp_modifiers(modifiers));
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -486,43 +771,191 @@ impl eframe::App for ShellApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_events(ui.ctx());
 
-        egui::Panel::top("barra").show(ui, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
+        egui::Panel::top("chrome")
+            .frame(
+                egui::Frame::new()
+                    .fill(CHROME)
+                    .inner_margin(egui::Margin::symmetric(8, 5)),
+            )
+            .show(ui, |ui| {
                 self.tab_strip(ui);
+                ui.add_space(4.0);
                 ui.separator();
                 ui.add_space(4.0);
-                let width = (ui.available_width() - 190.0).max(160.0);
-                let field = ui.add(
-                    egui::TextEdit::singleline(&mut self.address)
-                        .desired_width(width)
-                        .hint_text("https://…"),
-                );
-                let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if enter || ui.button("Ir").clicked() {
-                    self.navigate();
-                }
-                if ui.selectable_label(self.agent_open, "Agente").clicked() {
-                    self.agent_open = !self.agent_open;
-                }
+                self.toolbar(ui);
             });
-            ui.add_space(2.0);
-            ui.label(egui::RichText::new(&self.status).size(12.0).weak());
-            ui.add_space(2.0);
-        });
+
+        egui::Panel::bottom("status")
+            .frame(
+                egui::Frame::new()
+                    .fill(CHROME)
+                    .inner_margin(egui::Margin::symmetric(10, 4)),
+            )
+            .show(ui, |ui| self.status_bar(ui));
 
         if self.agent_open {
             egui::Panel::right("agente")
                 .resizable(true)
-                .default_size(370.0)
+                .default_size(360.0)
                 .show(ui, |ui| self.agent_panel(ui));
         }
 
-        egui::CentralPanel::default().show(ui, |ui| self.page(ui));
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(PAGE_BG))
+            .show(ui, |ui| self.page(ui));
 
         self.pending_window(ui.ctx());
         self.result_window(ui.ctx());
     }
+}
+
+/// Candado para HTTPS, globo para el resto: pista visual de navegador sin
+/// depender de glifos que la fuente no tenga.
+fn security_glyph(ui: &mut egui::Ui, url: &str) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), Sense::hover());
+    let center = rect.center();
+    let stroke = egui::Stroke::new(1.1, MUTED);
+    if url.starts_with("https://") {
+        ui.painter().rect_stroke(
+            Rect::from_center_size(center + egui::vec2(0.0, 1.6), egui::vec2(7.4, 5.4)),
+            1.2,
+            stroke,
+            egui::StrokeKind::Inside,
+        );
+        let mut shackle = Vec::new();
+        for step in 0..=10 {
+            let angle = std::f32::consts::PI + (step as f32 / 10.0) * std::f32::consts::PI;
+            shackle.push(egui::pos2(
+                center.x + 2.7 * angle.cos(),
+                center.y - 0.6 + 2.7 * angle.sin(),
+            ));
+        }
+        ui.painter().add(egui::Shape::line(shackle, stroke));
+    } else {
+        ui.painter().circle_stroke(center, 4.2, stroke);
+        ui.painter().line_segment(
+            [
+                egui::pos2(center.x - 4.2, center.y),
+                egui::pos2(center.x + 4.2, center.y),
+            ],
+            stroke,
+        );
+        ui.painter().line_segment(
+            [
+                egui::pos2(center.x, center.y - 4.2),
+                egui::pos2(center.x, center.y + 4.2),
+            ],
+            stroke,
+        );
+    }
+}
+
+fn texture_options() -> egui::TextureOptions {
+    egui::TextureOptions {
+        magnification: egui::TextureFilter::Linear,
+        minification: egui::TextureFilter::Linear,
+        wrap_mode: egui::TextureWrapMode::ClampToEdge,
+        mipmap_mode: Some(egui::TextureFilter::Linear),
+    }
+}
+
+/// Enter, borrado, flechas… El texto imprimible llega como `Event::Text` y va
+/// por `insertText`; aquí no se duplica.
+fn special_key(key: egui::Key) -> Option<(&'static str, &'static str, i64)> {
+    use egui::Key::*;
+    Some(match key {
+        Enter => ("Enter", "Enter", 13),
+        Backspace => ("Backspace", "Backspace", 8),
+        Delete => ("Delete", "Delete", 46),
+        Escape => ("Escape", "Escape", 27),
+        ArrowLeft => ("ArrowLeft", "ArrowLeft", 37),
+        ArrowUp => ("ArrowUp", "ArrowUp", 38),
+        ArrowRight => ("ArrowRight", "ArrowRight", 39),
+        ArrowDown => ("ArrowDown", "ArrowDown", 40),
+        Home => ("Home", "Home", 36),
+        End => ("End", "End", 35),
+        PageUp => ("PageUp", "PageUp", 33),
+        PageDown => ("PageDown", "PageDown", 34),
+        _ => return None,
+    })
+}
+
+/// Bits de modificadores de CDP: Alt=1, Ctrl=2, Meta=4, Shift=8.
+fn cdp_modifiers(modifiers: egui::Modifiers) -> u32 {
+    let mut bits = 0;
+    if modifiers.alt {
+        bits |= 1;
+    }
+    if modifiers.ctrl || modifiers.command {
+        bits |= 2;
+    }
+    if modifiers.shift {
+        bits |= 8;
+    }
+    bits
+}
+
+#[derive(Clone, Copy)]
+enum NavIcon {
+    Back,
+    Forward,
+    Reload,
+}
+
+/// Iconos dibujados a mano: la fuente por defecto de egui no trae flechas ni
+/// el símbolo de recargar, y salían como cuadros vacíos.
+fn nav_button(ui: &mut egui::Ui, icon: NavIcon, tip: &str) -> bool {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(26.0, 24.0), Sense::click());
+    let color = if response.hovered() {
+        Color32::WHITE
+    } else {
+        Color32::from_gray(205)
+    };
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, 7.0, Color32::from_rgb(44, 46, 53));
+    }
+
+    let center = rect.center();
+    let stroke = egui::Stroke::new(1.6, color);
+    match icon {
+        NavIcon::Back | NavIcon::Forward => {
+            let dir = if matches!(icon, NavIcon::Back) {
+                -1.0
+            } else {
+                1.0
+            };
+            let start = egui::pos2(center.x + dir * 5.5, center.y);
+            let end = egui::pos2(center.x - dir * 5.5, center.y);
+            ui.painter().line_segment([start, end], stroke);
+            ui.painter()
+                .line_segment([end, end + egui::vec2(dir * 4.2, -4.2)], stroke);
+            ui.painter()
+                .line_segment([end, end + egui::vec2(dir * 4.2, 4.2)], stroke);
+        }
+        NavIcon::Reload => {
+            let radius = 5.5;
+            let mut points = Vec::new();
+            for step in 0..=20 {
+                let angle = -std::f32::consts::FRAC_PI_2
+                    + (step as f32 / 20.0) * std::f32::consts::TAU * 0.8;
+                points.push(egui::pos2(
+                    center.x + radius * angle.cos(),
+                    center.y + radius * angle.sin(),
+                ));
+            }
+            let end = *points.last().expect("el arco tiene puntos");
+            ui.painter().add(egui::Shape::line(points, stroke));
+            ui.painter()
+                .line_segment([end, end + egui::vec2(-2.6, -3.2)], stroke);
+            ui.painter()
+                .line_segment([end, end + egui::vec2(2.6, -3.2)], stroke);
+        }
+    }
+
+    let clicked = response.clicked();
+    response.on_hover_text(tip);
+    clicked
 }
 
 fn display_title(tab: &TabInfo) -> String {
@@ -535,8 +968,46 @@ fn display_title(tab: &TabInfo) -> String {
     }
 }
 
+fn truncate(text: &str, max: usize) -> String {
+    if text.chars().count() > max {
+        format!("{}…", text.chars().take(max).collect::<String>())
+    } else {
+        text.to_string()
+    }
+}
+
 fn short_hash(hash: &str) -> &str {
     hash.get(..12).unwrap_or(hash)
+}
+
+/// Lo que escribe la persona en la barra: URL si lo parece, búsqueda si no.
+pub fn browser_url(input: &str) -> String {
+    let trimmed = input.trim();
+    let looks_like_url = trimmed.contains("://")
+        || (!trimmed.contains(' ')
+            && (trimmed.contains('.')
+                || trimmed.starts_with("localhost")
+                || trimmed.starts_with("127.0.0.1")
+                || trimmed.starts_with("[::1]")));
+    if looks_like_url {
+        normalize_url(trimmed)
+    } else {
+        format!("https://duckduckgo.com/?q={}", encode_query(trimmed))
+    }
+}
+
+fn encode_query(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            b' ' => out.push('+'),
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
 }
 
 /// Añade esquema si falta. `localhost` e IPs van por HTTP; el resto, HTTPS.
@@ -557,7 +1028,7 @@ pub fn normalize_url(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_url;
+    use super::{browser_url, normalize_url};
 
     #[test]
     fn completa_el_esquema_sin_romper_urls_explicitas() {
@@ -566,5 +1037,15 @@ mod tests {
         assert_eq!(normalize_url("localhost:3000"), "http://localhost:3000");
         assert_eq!(normalize_url("http://x.test/a"), "http://x.test/a");
         assert_eq!(normalize_url("  https://x.test  "), "https://x.test");
+    }
+
+    #[test]
+    fn las_palabras_sueltas_van_a_buscar() {
+        assert_eq!(
+            browser_url("navegador ai rust"),
+            "https://duckduckgo.com/?q=navegador+ai+rust"
+        );
+        assert_eq!(browser_url("ejemplo.com"), "https://ejemplo.com");
+        assert_eq!(browser_url("127.0.0.1:8977"), "http://127.0.0.1:8977");
     }
 }

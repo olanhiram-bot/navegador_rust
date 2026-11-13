@@ -8,8 +8,12 @@ Fecha: 2026-11-13
 
 - **pestañas**: una `Session<Chrome>` por pestaña, con su URL, generación y log;
 - **la página visible**, embebida desde Chromium por `Page.startScreencast`;
-- **barra de dirección**: escribe una URL, Enter o «Ir»;
+- **barra de dirección**: abre una URL o busca en DuckDuckGo si escribes
+  palabras; atrás/adelante/recargar contra el historial de CDP;
 - **scroll** con la rueda, mapeado a coordenadas CSS de la página;
+- **enlaces y campos**: un enlace navega a su `href`; un `textbox`,
+  `searchbox`, `combobox` o `select` recibe un click real de foco y lo tecleado
+  se reenvía (texto compuesto + teclas especiales);
 - **acciones sobre botones**: click → hit-test → ref `@eN` → `Session::act` →
   tarjeta modal → aprobar/denegar → recibo;
 - **panel del agente**: generación, refs vivas, recibos de la pestaña, ruta del
@@ -38,6 +42,10 @@ hilo egui (eframe)              hilo motor (tokio)
   cadena con dos escritores; MCP sigue usando su log independiente.
 - `EngineHandle::shutdown` pide el cierre y espera a que el hilo del motor
   dropee las sesiones, que matan sus grupos de procesos.
+- El motor despierta a la UI con `request_repaint` cuando emite un evento y la
+  UI descarta los frames viejos: solo aplica el último de cada lote.
+- El `deviceScaleFactor` se recorta si el viewport supera 7 Mpx para que un
+  frame RGBA no dispare la latencia.
 
 ## Actuar sin reenviar el click
 
@@ -46,8 +54,10 @@ aislado, se devuelve el selector CSS del elemento accionable y se cruza con el
 snapshot vivo para obtener su ref. Si el selector no está en el snapshot, no se
 actúa: una ref solo vale para la generación que la produjo.
 
-Solo los elementos con rol `button` pasan a `Session::act`. Enlaces y campos de
-texto se anuncian en la barra de estado y no ejecutan nada. La acción sigue las
+Solo los elementos con rol `button` pasan a `Session::act`. Los enlaces se
+resuelven a su `href` absoluto y navegan; los campos de texto y `select`
+reciben un click real para enfocar, sin ejecutar ninguna acción. Checkboxes,
+radios y elementos `clickable` se anuncian y no se tocan. La acción sigue las
 dos fases de siempre: sin aprobación, `act` devuelve el hash y la tarjeta; al
 aprobar, se llama con ese hash exacto, se observa la petición y solo entonces se
 firma el recibo. La tarjeta es una ventana egui con las filas reales, avisos y
@@ -66,25 +76,30 @@ no un canal MCP en proceso.
 
 ## Verificación
 
-- `cargo test -p shell`: tres tests contra Chromium real.
+- `cargo test -p shell`: cuatro tests contra Chromium real y dos unitarios.
   - frame RGBA + tamaño CSS y snapshot con elementos;
   - click sobre «Pagar $24.90» → `ApprovalRequired` con la tarjeta mostrando
     `24.90` → aprobar → `Executed` con recibo 0 verificado en disco;
   - abrir `settings.html` en una segunda pestaña, volver a la primera y cerrar
-    la segunda.
+    la segunda;
+  - navegar `shop → settings`, volver atrás y adelante con el historial.
 - El primer test del puente comprueba el apagado ordenado del motor; tras la
   suite no quedan procesos de Chromium.
 
 ## Límites
 
-- Sin teclado hacia la página: no se escriben campos de texto.
-- Los clicks en enlaces todavía no navegan; se usa la barra de dirección.
+- Checkboxes, radios y elementos `clickable` no se accionan: no hay tarjeta
+  para ellos.
+- Algunos sitios (Google) bloquean Chromium headless como tráfico automatizado;
+  no es un fallo de la shell.
+- Matar la shell con SIGTERM deja Chromium vivo: el cierre ordenado solo corre
+  al salir normalmente.
 - El panel del agente no es un canal MCP en proceso.
 - El demo de 60 segundos del gate de la fase 5 no está grabado.
 
 ## Siguiente
 
 1. Grabar el demo de 60 s de punta a punta.
-2. Teclado hacia campos y navegación por enlaces.
+2. Checkboxes, radios y controles de formulario con su política.
 3. Conectar de verdad al agente (socket o MCP embebido) y reflejar sus actos en
    el panel.
