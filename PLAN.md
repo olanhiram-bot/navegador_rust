@@ -1,6 +1,6 @@
 # PLAN — Navegador auditable
 
-Última actualización: 2026-11-13 · Estado: **fase 1 completa; siguiente: fase 2**
+Última actualización: 2026-11-13 · Estado: **fases 1 y 2 completas; siguiente: fase 3**
 
 ## Visión
 
@@ -22,6 +22,8 @@ verificable.
 crates/
   descriptor/    # ActionDescriptor, canonical JSON, hash, policy
   engine-cdp/    # lanzador de Chromium + cliente CDP mínimo
+  card/          # modelo de la tarjeta + renderizador egui (feature `gui`)
+  receipt/       # recibo ed25519 firmado y verificación offline
   navegador/     # binario CLI + arnés de ataques
 fixtures/        # páginas de ataque y tarea legítima
 docs/            # investigación, tesis, plan
@@ -45,14 +47,18 @@ docs/            # investigación, tesis, plan
 Evidencia: `docs/producto/2026-11-13-resultado-semana-1.md`. El binding es
 *pre-send*: `Fetch.requestPaused` aborta el POST sustituto antes de que salga.
 
-### Fase 2 — Action Card + recibo (semana 2) — **siguiente**
+### Fase 2 — Action Card + recibo (semana 2) — **completada**
 
 - Ventana nativa mínima con Deny dominante y valores escapados.
 - Binding por hash antes de despachar; `Network.postData` después.
 - Recibo firmado (ed25519) y verificación offline.
-- Gate: sustitución post-aprobación abortada 10/10; recibo verificado en otra máquina.
+- Gate: sustitución post-aprobación abortada 10/10; recibo verificado en otra máquina. **Cumplido.**
 
-### Fase 3 — SessionCore + MCP (semanas 3–4)
+Evidencia: `docs/producto/2026-11-13-resultado-semana-2.md`. La tarjeta es una
+ventana egui en el proceso del navegador (fuera del renderer de la página) y el
+recibo se verifica solo con su JSON, en otro proceso.
+
+### Fase 3 — SessionCore + MCP (semanas 3–4) — **siguiente**
 
 - Trait `Engine`, refs `@eN` estables con generación, action log.
 - Tools MCP: `open`, `snapshot`, `act`, `read`, `screenshot`, `handoff`.
@@ -83,7 +89,8 @@ Motor propio, fork de Chromium, extensiones, móvil, cloud, antidetect, CAPTCHA.
 |---|---|---|
 | AX no es ground truth | **Confirmado** | Descriptor desde DOM en isolated world |
 | BrowserOS ya graba y audita | **Confirmado** | Diferenciar por binding + recibo, no por replay |
-| Interceptar navegación con Fetch cuelga | **Confirmado** | `Network` + ejecutor propio |
+| Interceptar navegación con Fetch cuelga | **Resuelto** | `Fetch` se arma solo alrededor del click y se desactiva antes de navegar |
+| El recibo es autocontenido | **Aceptado** | Prueba integridad y binding, no identidad; fijar la clave es límite documentado |
 | iframes cross-origin van a otro proceso | **Confirmado** | Adjuntar target del iframe o bloquear |
 | Sitios reales resisten el descriptor | Abierto | Semana 5 con 3 escenarios reales |
 

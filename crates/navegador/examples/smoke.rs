@@ -6,7 +6,11 @@ use navegador::FixtureServer;
 async fn main() -> anyhow::Result<()> {
     eprintln!("[smoke] servidor");
     let server = FixtureServer::start();
-    eprintln!("[smoke] page={} sink={}", server.page_origin(), server.sink_origin());
+    eprintln!(
+        "[smoke] page={} sink={}",
+        server.page_origin(),
+        server.sink_origin()
+    );
 
     eprintln!("[smoke] lanzando chromium");
     let mut chrome = Chrome::launch().await?;
@@ -18,7 +22,10 @@ async fn main() -> anyhow::Result<()> {
     eprintln!("[smoke] cargada");
 
     let descriptor = chrome.extract("#go", 1, Provenance::User).await?;
-    eprintln!("[smoke] descriptor: {}", serde_json::to_string_pretty(&descriptor)?);
+    eprintln!(
+        "[smoke] descriptor: {}",
+        serde_json::to_string_pretty(&descriptor)?
+    );
 
     eprintln!("[smoke] despachando");
     let outcome = chrome.dispatch(&descriptor).await?;

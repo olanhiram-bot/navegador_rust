@@ -4,9 +4,9 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use descriptor::{ActionDescriptor, Provenance, RawAction};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
@@ -75,10 +75,14 @@ impl Chrome {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
 
+        // Grupo de procesos propio: al cerrar la sesión matamos también a los
+        // zygotes y renderers, que si no quedan huérfanos.
+        #[cfg(unix)]
+        command.process_group(0);
+
         let child = command
             .spawn()
             .with_context(|| format!("no se pudo lanzar {}", binary.display()))?;
-
         let port = wait_for_port(&profile_path, Duration::from_secs(20)).await?;
         let page_ws = page_target_ws(port).await?;
         let cdp = Cdp::connect(&page_ws).await?;
@@ -100,7 +104,14 @@ impl Chrome {
         self.child.id()
     }
 
-    pub async fn navigate(&self, url: &str) -> Result<()> {
+    pub async fn navigate(&mut self, url: &str) -> Result<()> {
+        // Interceptar durante una navegación principal cuelga el renderer:
+        // el documento queda pausado sin nadie que lo continúe. La
+        // interceptación vive solo alrededor del despacho.
+        if self.fetch_armed {
+            self.cdp.call("Fetch.disable", json!({})).await?;
+            self.fetch_armed = false;
+        }
         self.cdp.call("Page.enable", json!({})).await?;
         self.cdp.call("Runtime.enable", json!({})).await?;
         self.cdp.call("Network.enable", json!({})).await?;
@@ -124,7 +135,10 @@ impl Chrome {
                     }),
                 )
                 .await?;
-            if value.get("result").and_then(|r| r.get("value")).and_then(Value::as_str)
+            if value
+                .get("result")
+                .and_then(|r| r.get("value"))
+                .and_then(Value::as_str)
                 == Some("complete")
             {
                 break;
@@ -205,7 +219,11 @@ impl Chrome {
     /// antes de que salga. Si no coincide con lo aprobado, la aborta.
     pub async fn dispatch(&mut self, approved: &ActionDescriptor) -> Result<DispatchOutcome> {
         let observed = self
-            .extract(&approved.target.selector, approved.generation, approved.provenance)
+            .extract(
+                &approved.target.selector,
+                approved.generation,
+                approved.provenance,
+            )
             .await?;
         if observed.hash_hex != approved.hash_hex {
             return Ok(DispatchOutcome::RejectedBeforeDispatch {
@@ -285,9 +303,8 @@ impl Chrome {
                     // Candidata a "la acción": una navegación de documento o un
                     // POST. Si la página cambió el destino, igual cae aquí y el
                     // binding la rechaza.
-                    let is_candidate =
-                        resource_type.eq_ignore_ascii_case("Document")
-                            || method.eq_ignore_ascii_case("POST");
+                    let is_candidate = resource_type.eq_ignore_ascii_case("Document")
+                        || method.eq_ignore_ascii_case("POST");
 
                     if !is_candidate {
                         self.continue_request(&request_id).await?;
@@ -321,10 +338,7 @@ impl Chrome {
 
     async fn continue_request(&self, request_id: &str) -> Result<()> {
         self.cdp
-            .call(
-                "Fetch.continueRequest",
-                json!({ "requestId": request_id }),
-            )
+            .call("Fetch.continueRequest", json!({ "requestId": request_id }))
             .await?;
         Ok(())
     }
@@ -337,6 +351,20 @@ impl Chrome {
             )
             .await?;
         Ok(())
+    }
+}
+
+impl Drop for Chrome {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.child.id() {
+            // El hijo es líder de su propio grupo: así caen también zygotes y
+            // renderers, que de otro modo quedan huérfanos.
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+        }
+        let _ = self.child.start_kill();
     }
 }
 
@@ -367,10 +395,13 @@ async fn wait_for_port(profile: &std::path::Path, timeout: Duration) -> Result<u
     let file = profile.join("DevToolsActivePort");
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if let Ok(contents) = std::fs::read_to_string(&file) {
-            if let Some(port) = contents.lines().next().and_then(|l| l.trim().parse::<u16>().ok()) {
-                return Ok(port);
-            }
+        if let Ok(contents) = std::fs::read_to_string(&file)
+            && let Some(port) = contents
+                .lines()
+                .next()
+                .and_then(|l| l.trim().parse::<u16>().ok())
+        {
+            return Ok(port);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -394,9 +425,8 @@ async fn http_get(port: u16, path: &str) -> Result<String> {
         let mut stream = TcpStream::connect(("127.0.0.1", port))
             .await
             .context("no se pudo conectar al endpoint HTTP de CDP")?;
-        let request = format!(
-            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-        );
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
         stream.write_all(request.as_bytes()).await?;
 
         let mut buffer = Vec::new();

@@ -21,9 +21,12 @@ impl Harness {
         Harness { server, chrome }
     }
 
-    async fn open(&self, fixture: &str) {
+    async fn open(&mut self, fixture: &str) {
         let url = self.server.page_url(fixture);
-        self.chrome.navigate(&url).await.expect("la página debe cargar");
+        self.chrome
+            .navigate(&url)
+            .await
+            .expect("la página debe cargar");
     }
 
     fn intent(&self) -> Intent {
@@ -41,7 +44,7 @@ impl Harness {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ataque_1_confused_deputy_se_deniega() {
-    let harness = Harness::new().await;
+    let mut harness = Harness::new().await;
     harness.open("exfil.html").await;
 
     let descriptor = harness
@@ -70,7 +73,7 @@ async fn ataque_1_confused_deputy_se_deniega() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ataque_2_lies_in_the_loop_se_deniega() {
-    let harness = Harness::new().await;
+    let mut harness = Harness::new().await;
     harness.open("lie.html").await;
 
     let descriptor = harness

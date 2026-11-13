@@ -4,7 +4,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -107,7 +107,7 @@ impl Drop for FixtureServer {
 
 fn serve_page(
     mut stream: TcpStream,
-    fixtures: &PathBuf,
+    fixtures: &Path,
     page_origin: &str,
     sink_origin: &str,
     requests: &Arc<Mutex<Vec<RecordedRequest>>>,
@@ -187,10 +187,10 @@ fn read_request(stream: &mut TcpStream) -> Option<ParsedRequest> {
 
     let mut content_length = 0usize;
     for line in lines {
-        if let Some((key, value)) = line.split_once(':') {
-            if key.eq_ignore_ascii_case("content-length") {
-                content_length = value.trim().parse().unwrap_or(0);
-            }
+        if let Some((key, value)) = line.split_once(':')
+            && key.eq_ignore_ascii_case("content-length")
+        {
+            content_length = value.trim().parse().unwrap_or(0);
         }
     }
 
@@ -230,7 +230,7 @@ fn respond(
     };
     let response = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.as_bytes().len()
+        body.len()
     );
     stream.write_all(response.as_bytes())?;
     stream.flush()

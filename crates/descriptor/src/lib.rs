@@ -87,15 +87,13 @@ impl Inconsistency {
             Inconsistency::VisibleAmountMismatch {
                 visible_amount,
                 actual_amount,
-            } => format!(
-                "la página muestra {visible_amount:.2} pero se enviarán {actual_amount:.2}"
-            ),
+            } => {
+                format!("la página muestra {visible_amount:.2} pero se enviarán {actual_amount:.2}")
+            }
             Inconsistency::CrossOriginAction {
                 document_origin,
                 action_origin,
-            } => format!(
-                "la acción sale de {document_origin} hacia {action_origin}"
-            ),
+            } => format!("la acción sale de {document_origin} hacia {action_origin}"),
         }
     }
 }
@@ -166,13 +164,11 @@ impl ActionDescriptor {
                 });
             }
         }
-        if cross_origin {
-            if let (Some(a), d) = (&action_origin, &raw.document_origin) {
-                inconsistencies.push(Inconsistency::CrossOriginAction {
-                    document_origin: d.clone(),
-                    action_origin: a.clone(),
-                });
-            }
+        if cross_origin && let (Some(a), d) = (&action_origin, &raw.document_origin) {
+            inconsistencies.push(Inconsistency::CrossOriginAction {
+                document_origin: d.clone(),
+                action_origin: a.clone(),
+            });
         }
 
         let mut d = ActionDescriptor {
@@ -359,13 +355,13 @@ impl Intent {
                 }
             }
         }
-        if let Some(amount) = d.amount {
-            if amount > self.max_amount + AMOUNT_EPSILON {
-                deny.push(format!(
-                    "importe {amount:.2} excede el máximo permitido {:.2}",
-                    self.max_amount
-                ));
-            }
+        if let Some(amount) = d.amount
+            && amount > self.max_amount + AMOUNT_EPSILON
+        {
+            deny.push(format!(
+                "importe {amount:.2} excede el máximo permitido {:.2}",
+                self.max_amount
+            ));
         }
         match (self.amount, d.amount) {
             (Some(want), Some(got)) => {
@@ -521,7 +517,8 @@ pub fn visible_amounts(text: &str) -> Vec<f64> {
                 j += 1;
             }
             let start = j;
-            while j < chars.len() && (chars[j].is_ascii_digit() || chars[j] == '.' || chars[j] == ',')
+            while j < chars.len()
+                && (chars[j].is_ascii_digit() || chars[j] == '.' || chars[j] == ',')
             {
                 j += 1;
             }
@@ -723,12 +720,41 @@ mod tests {
             1,
         );
         assert!(
-            verify_wire(&d, "http://127.0.0.1:5000/pay", "POST", Some("to=ana&amount=1.00"))
-                .is_ok()
+            verify_wire(
+                &d,
+                "http://127.0.0.1:5000/pay",
+                "POST",
+                Some("to=ana&amount=1.00")
+            )
+            .is_ok()
         );
-        assert!(verify_wire(&d, "http://127.0.0.1:5000/pay", "POST", Some("to=mula&amount=1.00")).is_err());
-        assert!(verify_wire(&d, "http://127.0.0.1:5000/pay", "POST", Some("to=ana&amount=9999.00")).is_err());
-        assert!(verify_wire(&d, "http://127.0.0.1:6000/collect", "POST", Some("to=ana&amount=1.00")).is_err());
+        assert!(
+            verify_wire(
+                &d,
+                "http://127.0.0.1:5000/pay",
+                "POST",
+                Some("to=mula&amount=1.00")
+            )
+            .is_err()
+        );
+        assert!(
+            verify_wire(
+                &d,
+                "http://127.0.0.1:5000/pay",
+                "POST",
+                Some("to=ana&amount=9999.00")
+            )
+            .is_err()
+        );
+        assert!(
+            verify_wire(
+                &d,
+                "http://127.0.0.1:6000/collect",
+                "POST",
+                Some("to=ana&amount=1.00")
+            )
+            .is_err()
+        );
     }
 
     #[test]
