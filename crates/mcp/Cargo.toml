@@ -16,9 +16,10 @@ engine-cdp = { path = "../engine-cdp" }
 receipt = { path = "../receipt" }
 serde_json.workspace = true
 session = { path = "../session" }
-tokio = { workspace = true, features = ["io-std", "io-util"] }
+tokio = { workspace = true, features = ["io-std", "io-util", "signal", "sync"] }
 
 [dev-dependencies]
+libc.workspace = true
 navegador = { path = "../navegador" }
 tempfile.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "io-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "io-util", "signal"] }

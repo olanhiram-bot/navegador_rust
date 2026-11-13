@@ -12,6 +12,7 @@ Fecha: 2026-11-13 · Gate del MVP
 | La petición aprobada sale una sola vez | ✅ un POST `to=ana&amount=1.00` |
 | La aprobación está atada al hash | ✅ segundo `act` con `approve` |
 | Las refs caducan con la generación | ✅ tras ejecutar, generación 2 |
+| SIGTERM/SIGINT matan Chromium | ✅ tests de ciclo de vida |
 
 El gate vive en `crates/mcp/tests/gate.rs` y habla JSON-RPC de verdad con el
 binario `navegador-mcp` (stdin/stdout), contra Chromium y los fixtures.
@@ -109,6 +110,15 @@ cargo run -p mcp -- --log /tmp/recibos.jsonl --max-amount 20
    `snapshot`. El bug estaba oculto porque `read` no existía antes de MCP.
 3. **`ReceiptLog` no exponía su ruta**; `Session::handoff` la necesita para que
    la persona pueda auditar el log.
+4. **`tokio::io::stdin` impedía terminar.** Lee en un hilo bloqueante que el
+   runtime espera al apagarse; si el host seguía con el pipe abierto, el cierre
+   se colgaba aunque la señal se hubiera capturado. Ahora stdin se lee en un
+   hilo propio con canal, que no ata el apagado.
+5. **SIGTERM/SIGINT no ejecutan destructores por defecto.** El servidor las
+   captura, sale del bucle y dropea la sesión, de modo que `Chrome::Drop` mata
+   el grupo entero. Sin eso, matar el host dejaba Chromium vivo. Un SIGKILL al
+   servidor sigue siendo imposible de mitigar desde dentro; el límite queda
+   anotado.
 
 ## Límites que siguen abiertos
 

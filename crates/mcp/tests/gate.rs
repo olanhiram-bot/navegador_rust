@@ -16,7 +16,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 struct Host {
     child: Child,
-    stdin: BufWriter<ChildStdin>,
+    stdin: Option<BufWriter<ChildStdin>>,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
 }
@@ -32,7 +32,7 @@ impl Host {
             .kill_on_drop(true)
             .spawn()
             .expect("el servidor MCP debe arrancar");
-        let stdin = BufWriter::new(child.stdin.take().expect("stdin"));
+        let stdin = Some(BufWriter::new(child.stdin.take().expect("stdin")));
         let stdout = BufReader::new(child.stdout.take().expect("stdout"));
         Host {
             child,
@@ -44,9 +44,10 @@ impl Host {
 
     async fn send(&mut self, message: &Value) {
         let line = serde_json::to_string(message).unwrap();
-        self.stdin.write_all(line.as_bytes()).await.unwrap();
-        self.stdin.write_all(b"\n").await.unwrap();
-        self.stdin.flush().await.unwrap();
+        let stdin = self.stdin.as_mut().expect("stdin abierto");
+        stdin.write_all(line.as_bytes()).await.unwrap();
+        stdin.write_all(b"\n").await.unwrap();
+        stdin.flush().await.unwrap();
     }
 
     async fn read(&mut self) -> Value {
@@ -101,8 +102,13 @@ impl Host {
         block["text"].as_str().unwrap().to_string()
     }
 
-    fn kill(&mut self) {
-        let _ = self.child.start_kill();
+    /// Cierra stdin y espera la salida limpia del servidor. Matarlo con una
+    /// señal no capturada dejaría Chromium huérfano, justo lo que el servidor
+    /// evita al manejar SIGTERM/SIGINT.
+    async fn shutdown(&mut self) {
+        // Soltar el escritor cierra el pipe: el servidor lee EOF y sale.
+        drop(self.stdin.take());
+        let _ = tokio::time::timeout(Duration::from_secs(15), self.child.wait()).await;
     }
 }
 
@@ -235,5 +241,5 @@ async fn un_host_mcp_completa_tres_pasos_y_toda_accion_deja_recibo() {
     assert_eq!(first["seq"], 0);
     assert_eq!(first["prev"], "genesis");
 
-    host.kill();
+    host.shutdown().await;
 }
