@@ -21,6 +21,11 @@ Fecha: 2026-11-13
 
 ```bash
 cargo run -p shell -- https://ejemplo.com --log /tmp/recibos.jsonl
+
+# Para que Google/Cloudflare no detecten el modo headless:
+# Arch: sudo pacman -S xorg-server-xvfb
+# Con Xvfb en PATH, Chromium corre headful en un display virtual.
+# NAVEGADOR_HEADLESS=1 fuerza headless (CI).
 ```
 
 ## Arquitectura
@@ -32,6 +37,9 @@ hilo egui (eframe)              hilo motor (tokio)
 ```
 
 - El motor es el único dueño de los navegadores. La UI nunca toca CDP.
+- Si `Xvfb` está instalado, Chromium corre headful en un display X virtual y se
+  sigue viendo por screencast. Sin Xvfb cae a `--headless=new`; ahí los sitios
+  con anti-bot pueden rechazarlo.
 - Los frames llegan en JPEG, se decodifican a RGBA en el hilo del motor y la UI
   los sube a una textura por pestaña. Cada frame se confirma con
   `screencastFrameAck`, sin lo cual Chromium deja de enviar.
@@ -93,8 +101,8 @@ no un canal MCP en proceso.
 
 - Checkboxes, radios y elementos `clickable` no se accionan: no hay tarjeta
   para ellos.
-- Algunos sitios (Google) bloquean Chromium headless como tráfico automatizado;
-  no es un fallo de la shell.
+- Sin Xvfb, algunos sitios (Google, Cloudflare) bloquean Chromium headless como
+  tráfico automatizado; no es un fallo de la shell.
 - Matar la shell con SIGTERM deja Chromium vivo: el cierre ordenado solo corre
   al salir normalmente.
 - El panel del agente no es un canal MCP en proceso.

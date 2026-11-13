@@ -1,7 +1,7 @@
 //! Lanzador de Chromium y operaciones de alto nivel: navegar, extraer el
 //! descriptor y despachar una acción verificada.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -22,6 +22,9 @@ const HIT_JS: &str = include_str!("hit.js");
 pub struct Chrome {
     child: Child,
     _profile: tempfile::TempDir,
+    /// Display virtual para el modo headful. Sin él, Chromium corre headless y
+    /// los captchas lo identifican como bot.
+    _display: Option<VirtualDisplay>,
     port: u16,
     cdp: Cdp,
     fetch_armed: bool,
@@ -33,11 +36,24 @@ impl Chrome {
         let profile = tempfile::tempdir().context("no se pudo crear el perfil temporal")?;
         let profile_path = profile.path().to_path_buf();
 
+        // Con Xvfb disponible, Chromium corre headful dentro de un display
+        // virtual: los sitios ven un navegador normal. Sin Xvfb se mantiene el
+        // modo headless (útil para CI y para quien no quiera instalar X11).
+        let display = if use_virtual_display() {
+            match VirtualDisplay::start().await {
+                Ok(display) => Some(display),
+                Err(error) => {
+                    eprintln!("Xvfb no arrancó ({error:#}); sigo en headless");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let mut command = Command::new(&binary);
         command
-            .arg("--headless=new")
             .arg("--no-sandbox")
-            .arg("--disable-gpu")
             .arg("--disable-dev-shm-usage")
             .arg("--disable-extensions")
             .arg("--disable-background-networking")
@@ -45,11 +61,25 @@ impl Chrome {
             .arg("--no-default-browser-check")
             .arg("--mute-audio")
             .arg("--hide-scrollbars")
-            .arg("--window-size=1024,768")
+            .arg("--window-size=1600,1000")
             .arg("--remote-debugging-port=0")
             .arg(format!("--user-data-dir={}", profile_path.display()))
             .arg("about:blank")
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+
+        match &display {
+            Some(display) => {
+                command
+                    .env("DISPLAY", &display.display)
+                    .env_remove("WAYLAND_DISPLAY")
+                    .arg("--ozone-platform=x11")
+                    .arg("--window-position=0,0");
+            }
+            None => {
+                command.arg("--headless=new").arg("--disable-gpu");
+            }
+        };
+        command
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
@@ -69,6 +99,7 @@ impl Chrome {
         Ok(Chrome {
             child,
             _profile: profile,
+            _display: display,
             port,
             cdp,
             fetch_armed: false,
@@ -755,6 +786,67 @@ impl Drop for Chrome {
         }
         let _ = self.child.start_kill();
     }
+}
+
+/// Display X virtual para correr Chromium headful sin abrir una ventana en el
+/// escritorio. Se usa solo si `Xvfb` está instalado y no se pidió headless.
+struct VirtualDisplay {
+    child: Child,
+    display: String,
+}
+
+impl VirtualDisplay {
+    async fn start() -> Result<Self> {
+        let binary = find_in_path("Xvfb").context("Xvfb no está en PATH")?;
+        for n in 99..=110 {
+            if Path::new(&format!("/tmp/.X{n}-lock")).exists() {
+                continue;
+            }
+            let display = format!(":{n}");
+            let mut child = Command::new(&binary)
+                .arg(&display)
+                .args(["-screen", "0", "1920x1200x24", "-nolisten", "tcp", "-ac"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .with_context(|| format!("lanzar Xvfb en {display}"))?;
+
+            let socket = format!("/tmp/.X11-unix/X{n}");
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                if Path::new(&socket).exists() {
+                    return Ok(Self { child, display });
+                }
+                if let Ok(Some(_)) = child.try_wait() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+        bail!("Xvfb no arrancó en ningún display :99-:110")
+    }
+}
+
+impl Drop for VirtualDisplay {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+    }
+}
+
+fn use_virtual_display() -> bool {
+    std::env::var_os("NAVEGADOR_HEADLESS").is_none() && find_in_path("Xvfb").is_some()
+}
+
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join(name))
+            .find(|candidate| candidate.is_file())
+    })
 }
 
 fn find_binary() -> Result<PathBuf> {

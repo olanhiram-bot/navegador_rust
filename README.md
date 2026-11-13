@@ -11,10 +11,10 @@ deja un recibo firmado que se verifica offline. Un host MCP completa un flujo de
 `open` → `snapshot` → `act` por stdio. La fase 4 añade política de orígenes
 read-only/read-write, perfiles efímeros y 3 escenarios locales con 0 falsos
 bloqueos; falta validarlos en sitios reales. La fase 5 ya tiene una **shell
-mínima**: pestañas, página visible por screencast CDP, barra de dirección,
-scroll, acciones sobre botones con tarjeta modal y recibo, y panel del agente
-con generación, refs y handoff. Sin teclado hacia la página ni demo de 60 s
-grabado todavía.
+mínima**: pestañas, página visible por screencast CDP, barra de dirección con
+búsqueda, scroll, navegación por enlaces, campos de texto con teclado,
+atrás/adelante, acciones sobre botones con tarjeta modal y recibo, y panel del
+agente con generación, refs y handoff. Falta el demo de 60 s grabado.
 
 ## Cómo correrlo
 
@@ -23,6 +23,10 @@ cargo test --workspace --all-targets   # unitarios, arnés de ataques y gate MCP
 
 # shell mínima: página visible, barra de dirección y handoff
 cargo run -p shell -- https://ejemplo.com --log /tmp/recibos.jsonl
+
+# recomendado para sitios con captcha (Chromium headful en display virtual)
+# Arch: sudo pacman -S xorg-server-xvfb
+# NAVEGADOR_HEADLESS=1 fuerza el modo headless (CI)
 
 # servidor MCP por stdio, con log de recibos encadenado
 cargo run -p mcp -- --log /tmp/recibos.jsonl --max-amount 20
@@ -48,7 +52,10 @@ Códigos de salida: `0` correcto · `2` denegado por política o recibo inválid
 del descriptor de forma no interactiva (útil para CI y scripts).
 
 `NAVEGADOR_CHROME` permite apuntar a un binario concreto. Por defecto se buscan
-`chromium`, `chromium-browser` y `google-chrome-stable`.
+`chromium`, `chromium-browser` y `google-chrome-stable`. Si `Xvfb` está en
+`PATH`, la shell lanza Chromium headful dentro de un display virtual; así los
+sitios no lo detectan como navegador automatizado. `NAVEGADOR_HEADLESS=1`
+fuerza headless.
 
 ## Estructura
 
