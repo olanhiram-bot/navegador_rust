@@ -17,10 +17,11 @@
 //!     lo verifica y lo anexa al log antes de devolver el resultado.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use card::CardView;
 use descriptor::{ActionDescriptor, Decision, Intent, Provenance};
-use engine::{DispatchOutcome, ElementRef, Engine, Snapshot};
+use engine::{DispatchOutcome, ElementRef, Engine, Snapshot, Transport};
 use receipt::{Identity, Receipt, ReceiptLog, WireRequest};
 
 /// Qué orígenes puede leer y a cuáles puede enviar datos la sesión.
@@ -461,6 +462,48 @@ impl<E: Engine> Session<E> {
         if !self.allowed_origins.contains(&origin) {
             self.allowed_origins.push(origin);
         }
+    }
+}
+
+impl<E: Engine + Transport> Session<E> {
+    pub async fn start_screencast(&mut self) -> Result<(), SessionError> {
+        self.engine.start_screencast().await?;
+        Ok(())
+    }
+
+    pub async fn stop_screencast(&mut self) -> Result<(), SessionError> {
+        self.engine.stop_screencast().await?;
+        Ok(())
+    }
+
+    pub async fn next_event(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<serde_json::Value>, SessionError> {
+        Ok(self.engine.next_event(timeout).await?)
+    }
+
+    pub async fn ack_screencast_frame(&mut self, session_id: i64) -> Result<(), SessionError> {
+        self.engine.ack_screencast_frame(session_id).await?;
+        Ok(())
+    }
+
+    pub async fn scroll(&mut self, x: f64, y: f64, delta_y: f64) -> Result<(), SessionError> {
+        self.engine.scroll(x, y, delta_y).await?;
+        Ok(())
+    }
+
+    /// Elemento accionable bajo un punto, solo si sigue en el snapshot vivo.
+    pub async fn element_at(&mut self, x: f64, y: f64) -> Result<Option<ElementRef>, SessionError> {
+        let Some(selector) = self.engine.hit_test(x, y).await? else {
+            return Ok(None);
+        };
+        let snapshot = self.snapshot.as_ref().ok_or(SessionError::NoSnapshot)?;
+        Ok(snapshot
+            .elements
+            .iter()
+            .find(|element| element.selector == selector)
+            .cloned())
     }
 }
 

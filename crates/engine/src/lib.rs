@@ -5,6 +5,7 @@
 //! sepan si debajo hay Chromium, Servo o un motor falso de test.
 
 use std::future::Future;
+use std::time::Duration;
 
 use descriptor::{ActionDescriptor, Provenance};
 use serde::{Deserialize, Serialize};
@@ -120,6 +121,41 @@ impl Snapshot {
         }
         out
     }
+}
+
+/// Transporte que necesita una shell: píxeles, eventos e hit-test.
+///
+/// No incluye ejecutar acciones: la shell sigue pasando por `Session::act`,
+/// que es lo único que firma recibos. Este trait solo mueve lo que se ve y lo
+/// que se toca.
+pub trait Transport {
+    fn start_screencast(&mut self) -> impl Future<Output = anyhow::Result<()>> + Send;
+
+    fn stop_screencast(&mut self) -> impl Future<Output = anyhow::Result<()>> + Send;
+
+    fn next_event(
+        &mut self,
+        timeout: Duration,
+    ) -> impl Future<Output = anyhow::Result<Option<serde_json::Value>>> + Send;
+
+    fn ack_screencast_frame(
+        &mut self,
+        session_id: i64,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
+
+    fn scroll(
+        &mut self,
+        x: f64,
+        y: f64,
+        delta_y: f64,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
+
+    /// Selector CSS del elemento accionable bajo un punto de la página.
+    fn hit_test(
+        &self,
+        x: f64,
+        y: f64,
+    ) -> impl Future<Output = anyhow::Result<Option<String>>> + Send;
 }
 
 /// El motor mínimo que la sesión necesita.

@@ -16,6 +16,7 @@ use crate::cdp::Cdp;
 
 const EXTRACT_JS: &str = include_str!("extract.js");
 const SNAPSHOT_JS: &str = include_str!("snapshot.js");
+const HIT_JS: &str = include_str!("hit.js");
 
 /// Chromium headless controlado por CDP.
 pub struct Chrome {
@@ -154,6 +155,18 @@ impl Chrome {
         }
         let raw: RawAction = serde_json::from_value(value).context("RawAction inválido")?;
         Ok(ActionDescriptor::from_raw(raw, provenance, generation))
+    }
+
+    /// Selector CSS del elemento accionable bajo el punto, en el mundo aislado.
+    /// La shell lo cruza con el snapshot para obtener su ref `@eN`.
+    pub async fn hit_test(&self, x: f64, y: f64) -> Result<Option<String>> {
+        let expression = format!("({HIT_JS})({x}, {y})");
+        let text = self.evaluate_isolated(&expression).await?;
+        let value: Value = serde_json::from_str(&text).context("JSON de hit-test inválido")?;
+        Ok(value
+            .get("selector")
+            .and_then(Value::as_str)
+            .map(str::to_string))
     }
 
     /// Foto de los elementos accionables, con refs `@eN` ligadas a `generation`.
@@ -537,6 +550,47 @@ impl Engine for Chrome {
 
     fn read_text(&mut self) -> impl std::future::Future<Output = Result<String>> + Send {
         Chrome::read_text(self)
+    }
+}
+
+impl engine::Transport for Chrome {
+    fn start_screencast(&mut self) -> impl std::future::Future<Output = Result<()>> + Send {
+        Chrome::start_screencast(self)
+    }
+
+    fn stop_screencast(&mut self) -> impl std::future::Future<Output = Result<()>> + Send {
+        Chrome::stop_screencast(self)
+    }
+
+    fn next_event(
+        &mut self,
+        timeout: Duration,
+    ) -> impl std::future::Future<Output = Result<Option<Value>>> + Send {
+        Chrome::next_event(self, timeout)
+    }
+
+    fn ack_screencast_frame(
+        &mut self,
+        session_id: i64,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        Chrome::ack_screencast_frame(self, session_id)
+    }
+
+    fn scroll(
+        &mut self,
+        x: f64,
+        y: f64,
+        delta_y: f64,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        Chrome::scroll(self, x, y, delta_y)
+    }
+
+    fn hit_test(
+        &self,
+        x: f64,
+        y: f64,
+    ) -> impl std::future::Future<Output = Result<Option<String>>> + Send {
+        Chrome::hit_test(self, x, y)
     }
 }
 
