@@ -4,15 +4,20 @@ Un navegador local y abierto donde una persona y un agente comparten la misma
 sesión, y donde toda acción con consecuencias queda atada a la acción que
 realmente se ejecuta.
 
-**Estado: fase 2 completa.** El descriptor ground-truth detecta los ataques, la
+**Estado: fase 3 completa.** El descriptor ground-truth detecta los ataques, la
 tarjeta muestra el valor real antes de aprobar, la sustitución posterior a la
 aprobación se aborta 10/10 y cada acción ejecutada deja un recibo firmado que se
-verifica offline.
+verifica offline. Un host MCP completa un flujo de `open` → `snapshot` → `act`
+por stdio, y todo `act` pasa por la misma cadena: descriptor, política, tarjeta,
+binding y recibo.
 
 ## Cómo correrlo
 
 ```bash
-cargo test --workspace          # unitarios + arnés de ataques (requiere Chromium)
+cargo test --workspace --all-targets   # unitarios, arnés de ataques y gate MCP (requiere Chromium)
+
+# servidor MCP por stdio, con log de recibos encadenado
+cargo run -p mcp -- --log /tmp/recibos.jsonl --max-amount 20
 
 # auditar sin ejecutar: tarjeta + descriptor + decisión
 cargo run -p navegador -- audit https://ejemplo.com "#pagar" 1.00 ana
@@ -41,9 +46,12 @@ del descriptor de forma no interactiva (útil para CI y scripts).
 
 ```
 crates/descriptor/   ActionDescriptor, hash canónico, intención, política, binding
+crates/engine/       Trait Engine + Snapshot + refs @eN con generación
 crates/engine-cdp/   Lanzador de Chromium + cliente CDP + extracción en mundo aislado
 crates/card/         Modelo de la tarjeta (testeable sin pantalla) + render egui
-crates/receipt/      Recibo ed25519 firmado y verificación offline
+crates/receipt/      Recibo ed25519 firmado, verificación offline y log encadenado
+crates/session/      SessionCore: refs, política, tarjeta, dispatch y recibo
+crates/mcp/          Servidor MCP por stdio (open, snapshot, act, read, screenshot, handoff)
 crates/navegador/    Servidor de fixtures, CLI y arnés de ataques
 fixtures/            exfil, lie-in-the-loop, sustitución y tarea legítima
 docs/                investigación, tesis y plan
@@ -78,5 +86,6 @@ documentado, no un fallo oculto.
 - [Plan de arranque del MVP](docs/producto/2026-11-13-plan-arranque-mvp.md)
 - [Resultado de la semana 1](docs/producto/2026-11-13-resultado-semana-1.md)
 - [Resultado de la semana 2](docs/producto/2026-11-13-resultado-semana-2.md)
+- [Resultado de la semana 3](docs/producto/2026-11-13-resultado-semana-3.md)
 - [Recomendación de arquitectura](docs/investigacion/2026-11-12-recomendacion-arquitectura.md)
 - [Plan completo](PLAN.md)

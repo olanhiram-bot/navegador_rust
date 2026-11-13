@@ -1,6 +1,6 @@
 # PLAN — Navegador auditable
 
-Última actualización: 2026-11-13 · Estado: **fases 1 y 2 completas; siguiente: fase 3**
+Última actualización: 2026-11-13 · Estado: **fases 1–3 completas; siguiente: fase 4**
 
 ## Visión
 
@@ -21,9 +21,12 @@ verificable.
 ```
 crates/
   descriptor/    # ActionDescriptor, canonical JSON, hash, policy
+  engine/        # trait Engine, Snapshot y refs @eN con generación
   engine-cdp/    # lanzador de Chromium + cliente CDP mínimo
   card/          # modelo de la tarjeta + renderizador egui (feature `gui`)
-  receipt/       # recibo ed25519 firmado y verificación offline
+  receipt/       # recibo ed25519 firmado, verificación offline y log encadenado
+  session/       # SessionCore: la única puerta agente ↔ navegador
+  mcp/           # servidor MCP por stdio + binario navegador-mcp
   navegador/     # binario CLI + arnés de ataques
 fixtures/        # páginas de ataque y tarea legítima
 docs/            # investigación, tesis, plan
@@ -58,13 +61,17 @@ Evidencia: `docs/producto/2026-11-13-resultado-semana-2.md`. La tarjeta es una
 ventana egui en el proceso del navegador (fuera del renderer de la página) y el
 recibo se verifica solo con su JSON, en otro proceso.
 
-### Fase 3 — SessionCore + MCP (semanas 3–4) — **siguiente**
+### Fase 3 — SessionCore + MCP (semanas 3–4) — **completada**
 
 - Trait `Engine`, refs `@eN` estables con generación, action log.
 - Tools MCP: `open`, `snapshot`, `act`, `read`, `screenshot`, `handoff`.
-- Gate: un host MCP completa un flujo de 3 pasos; 100% de acciones consecuentes con recibo.
+- Gate: un host MCP completa un flujo de 3 pasos; 100% de acciones consecuentes con recibo. **Cumplido.**
 
-### Fase 4 — Endurecer (semanas 5–6)
+Evidencia: `docs/producto/2026-11-13-resultado-semana-3.md`. El gate habla
+JSON-RPC por stdio con `navegador-mcp`; `act` es de dos fases (hash de
+aprobación) y solo un `Sent` produce recibo en el log encadenado.
+
+### Fase 4 — Endurecer (semanas 5–6) — **siguiente**
 
 - Perfiles efímeros, sets de orígenes read-only/read-write, egress policy.
 - 3 escenarios reales, métricas de falsos bloqueos, CI de regresión.
