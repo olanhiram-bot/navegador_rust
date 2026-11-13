@@ -4,17 +4,23 @@ Un navegador local y abierto donde una persona y un agente comparten la misma
 sesión, y donde toda acción con consecuencias queda atada a la acción que
 realmente se ejecuta.
 
-**Estado: fase 3 completa.** El descriptor ground-truth detecta los ataques, la
-tarjeta muestra el valor real antes de aprobar, la sustitución posterior a la
-aprobación se aborta 10/10 y cada acción ejecutada deja un recibo firmado que se
-verifica offline. Un host MCP completa un flujo de `open` → `snapshot` → `act`
-por stdio, y todo `act` pasa por la misma cadena: descriptor, política, tarjeta,
-binding y recibo.
+**Estado: fase 3 completa; fase 4 en curso.** El descriptor ground-truth
+detecta los ataques, la tarjeta muestra el valor real antes de aprobar, la
+sustitución posterior a la aprobación se aborta 10/10 y cada acción ejecutada
+deja un recibo firmado que se verifica offline. Un host MCP completa un flujo de
+`open` → `snapshot` → `act` por stdio. La fase 4 añade política de orígenes
+read-only/read-write, perfiles efímeros y 3 escenarios locales con 0 falsos
+bloqueos; falta validarlos en sitios reales. La fase 5 ya tiene una **shell
+mínima**: página visible por screencast CDP, barra de dirección, scroll y panel
+de handoff; todavía es de solo lectura y no hay demo de 60 s grabado.
 
 ## Cómo correrlo
 
 ```bash
 cargo test --workspace --all-targets   # unitarios, arnés de ataques y gate MCP (requiere Chromium)
+
+# shell mínima: página visible, barra de dirección y handoff
+cargo run -p shell -- https://ejemplo.com --log /tmp/recibos.jsonl
 
 # servidor MCP por stdio, con log de recibos encadenado
 cargo run -p mcp -- --log /tmp/recibos.jsonl --max-amount 20
@@ -50,8 +56,9 @@ crates/engine/       Trait Engine + Snapshot + refs @eN con generación
 crates/engine-cdp/   Lanzador de Chromium + cliente CDP + extracción en mundo aislado
 crates/card/         Modelo de la tarjeta (testeable sin pantalla) + render egui
 crates/receipt/      Recibo ed25519 firmado, verificación offline y log encadenado
-crates/session/      SessionCore: refs, política, tarjeta, dispatch y recibo
+crates/session/      SessionCore: refs, política de orígenes, tarjeta, dispatch y recibo
 crates/mcp/          Servidor MCP por stdio (open, snapshot, act, read, screenshot, handoff)
+crates/shell/        Shell egui: screencast de la página, omnibox y handoff
 crates/navegador/    Servidor de fixtures, CLI y arnés de ataques
 fixtures/            exfil, lie-in-the-loop, sustitución y tarea legítima
 docs/                investigación, tesis y plan
@@ -87,5 +94,7 @@ documentado, no un fallo oculto.
 - [Resultado de la semana 1](docs/producto/2026-11-13-resultado-semana-1.md)
 - [Resultado de la semana 2](docs/producto/2026-11-13-resultado-semana-2.md)
 - [Resultado de la semana 3](docs/producto/2026-11-13-resultado-semana-3.md)
+- [Resultado de la semana 4](docs/producto/2026-11-13-resultado-semana-4.md)
+- [Shell mínima](docs/producto/2026-11-13-shell-minima.md)
 - [Recomendación de arquitectura](docs/investigacion/2026-11-12-recomendacion-arquitectura.md)
 - [Plan completo](PLAN.md)

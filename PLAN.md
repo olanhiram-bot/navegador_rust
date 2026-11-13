@@ -1,6 +1,6 @@
 # PLAN — Navegador auditable
 
-Última actualización: 2026-11-13 · Estado: **fases 1–3 completas; siguiente: fase 4**
+Última actualización: 2026-11-13 · Estado: **fases 1–3 completas; fase 4 en curso (política de orígenes y escenarios locales); siguiente: sitios reales y fase 5**
 
 ## Visión
 
@@ -71,15 +71,27 @@ Evidencia: `docs/producto/2026-11-13-resultado-semana-3.md`. El gate habla
 JSON-RPC por stdio con `navegador-mcp`; `act` es de dos fases (hash de
 aprobación) y solo un `Sent` produce recibo en el log encadenado.
 
-### Fase 4 — Endurecer (semanas 5–6) — **siguiente**
+### Fase 4 — Endurecer (semanas 5–6) — **en curso**
 
 - Perfiles efímeros, sets de orígenes read-only/read-write, egress policy.
+  **Hecho:** `OriginPolicy::Allowlist`, perfil temporal por instancia y egreso
+  de acciones denegado antes del click.
 - 3 escenarios reales, métricas de falsos bloqueos, CI de regresión.
+  **Parcial:** 3 escenarios realistas locales con 3/3 ejecutados y 0 falsos
+  bloqueos; validación en sitios reales pendiente y manual.
 
-### Fase 5 — Shell (semanas 7–8)
+Evidencia: `docs/producto/2026-11-13-resultado-semana-4.md`. La política cubre
+acciones, no todos los subrecursos de la página; ese es el límite declarado.
+
+### Fase 5 — Shell (semanas 7–8) — **en curso**
 
 - GPUI o egui: pestañas, omnibox, panel del agente, handoff.
-- Gate: el demo de 60 segundos grabado de punta a punta.
+  **Hecho:** shell egui con página visible por screencast CDP, omnibox, scroll y
+  panel de handoff; sigue el principio de solo lectura (no hace click en
+  controles de formulario).
+  **Pendiente:** pestañas, panel del agente conectado, acciones desde la shell
+  pasando por tarjeta, y el demo de 60 s grabado.
+- Gate: el demo de 60 segundos grabado de punta a punta. **Pendiente.**
 
 ### Fase 6 — Servo (post-MVP)
 

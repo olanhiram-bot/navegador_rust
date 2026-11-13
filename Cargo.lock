@@ -1281,6 +1281,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -1492,6 +1494,7 @@ dependencies = [
  "base64",
  "card",
  "engine-cdp",
+ "libc",
  "navegador",
  "receipt",
  "serde_json",
@@ -1603,6 +1606,7 @@ dependencies = [
  "engine-cdp",
  "receipt",
  "serde_json",
+ "session",
  "tempfile",
  "tokio",
  "url",
@@ -2466,6 +2470,23 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "digest",
+]
+
+[[package]]
+name = "shell"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "eframe",
+ "engine-cdp",
+ "image",
+ "navegador",
+ "receipt",
+ "serde_json",
+ "session",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

@@ -255,6 +255,64 @@ impl Chrome {
             .context("la captura no es base64 válido")
     }
 
+    /// Empieza a transmitir frames de la página. La shell los pinta; el motor
+    /// solo transporta píxeles, no decide nada.
+    pub async fn start_screencast(&self) -> Result<()> {
+        self.cdp
+            .call(
+                "Page.startScreencast",
+                json!({
+                    "format": "jpeg",
+                    "quality": 70,
+                    "maxWidth": 1280,
+                    "maxHeight": 800,
+                    "everyNthFrame": 1,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn stop_screencast(&self) -> Result<()> {
+        self.cdp.call("Page.stopScreencast", json!({})).await?;
+        Ok(())
+    }
+
+    /// Siguiente evento CDP, con timeout. Los eventos se bufferean aparte de
+    /// las respuestas, así que esto no interfiere con `call`.
+    pub async fn next_event(&mut self, timeout: Duration) -> Result<Option<Value>> {
+        self.cdp.next_event(timeout).await
+    }
+
+    /// Sin ack, Chromium deja de enviar frames.
+    pub async fn ack_screencast_frame(&self, session_id: i64) -> Result<()> {
+        self.cdp
+            .call(
+                "Page.screencastFrameAck",
+                json!({ "sessionId": session_id }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Rueda del ratón en coordenadas CSS de la página. No hace click: la
+    /// shell es de solo lectura y las acciones pasan por la tarjeta.
+    pub async fn scroll(&self, x: f64, y: f64, delta_y: f64) -> Result<()> {
+        self.cdp
+            .call(
+                "Input.dispatchMouseEvent",
+                json!({
+                    "type": "mouseWheel",
+                    "x": x,
+                    "y": y,
+                    "deltaX": 0.0,
+                    "deltaY": delta_y,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Evalúa en el mundo aislado y devuelve el valor como texto JSON.
     async fn evaluate_isolated(&self, expression: &str) -> Result<String> {
         let frame = self
