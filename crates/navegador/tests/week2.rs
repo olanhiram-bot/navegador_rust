@@ -34,7 +34,7 @@ impl Harness {
     fn intent(&self) -> Intent {
         Intent {
             provenance: Provenance::User,
-            verb: Verb::Submit,
+            verb: Some(Verb::Submit),
             amount: Some(1.00),
             recipient: Some("ana".into()),
             allowed_action_origins: vec![self.server.page_origin()],

@@ -207,7 +207,7 @@ fn task_args(positional: &[String]) -> Result<(String, String, Intent)> {
 
     let intent = Intent {
         provenance: Provenance::User,
-        verb: descriptor::Verb::Submit,
+        verb: Some(descriptor::Verb::Submit),
         amount,
         recipient,
         allowed_action_origins: vec![document_origin],

@@ -205,7 +205,7 @@ mod tests {
     fn intent() -> Intent {
         Intent {
             provenance: Provenance::User,
-            verb: Verb::Submit,
+            verb: Some(Verb::Submit),
             amount: Some(1.0),
             recipient: Some("ana".into()),
             allowed_action_origins: vec!["http://127.0.0.1:5000".into()],

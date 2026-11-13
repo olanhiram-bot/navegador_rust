@@ -597,7 +597,7 @@ mod tests {
     fn intent(amount: f64, recipient: &str) -> Intent {
         Intent {
             provenance: Provenance::User,
-            verb: Verb::Submit,
+            verb: Some(Verb::Submit),
             amount: Some(amount),
             recipient: Some(recipient.into()),
             allowed_action_origins: vec!["http://127.0.0.1:5000".into()],

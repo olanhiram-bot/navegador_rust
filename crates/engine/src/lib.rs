@@ -66,7 +66,10 @@ impl ElementRef {
 }
 
 fn normalize(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// Foto de la página en una generación concreta.
@@ -108,7 +111,11 @@ impl Snapshot {
                 } else {
                     &element.name
                 },
-                if element.disabled { "  [deshabilitado]" } else { "" }
+                if element.disabled {
+                    "  [deshabilitado]"
+                } else {
+                    ""
+                }
             ));
         }
         out
@@ -119,7 +126,10 @@ impl Snapshot {
 pub trait Engine {
     fn navigate(&mut self, url: &str) -> impl Future<Output = anyhow::Result<()>> + Send;
 
-    fn snapshot(&mut self, generation: u32) -> impl Future<Output = anyhow::Result<Snapshot>> + Send;
+    fn snapshot(
+        &mut self,
+        generation: u32,
+    ) -> impl Future<Output = anyhow::Result<Snapshot>> + Send;
 
     fn extract(
         &self,
