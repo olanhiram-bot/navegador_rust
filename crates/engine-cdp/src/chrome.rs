@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use descriptor::{ActionDescriptor, Provenance, RawAction};
+use engine::{DispatchOutcome, ElementRef, Engine, Snapshot};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -14,30 +15,7 @@ use tokio::process::{Child, Command};
 use crate::cdp::Cdp;
 
 const EXTRACT_JS: &str = include_str!("extract.js");
-
-#[derive(Debug, Clone)]
-pub enum DispatchOutcome {
-    /// La petición coincidía con lo aprobado y se dejó salir.
-    Sent {
-        url: String,
-        method: String,
-        body: Option<String>,
-    },
-    /// El DOM cambió entre la aprobación y el despacho: no se hizo click.
-    RejectedBeforeDispatch {
-        approved_hash: String,
-        observed_hash: String,
-    },
-    /// Se hizo click, pero la petición interceptada no era la aprobada: se abortó.
-    Blocked {
-        url: String,
-        method: String,
-        body: Option<String>,
-        reason: String,
-    },
-    /// No se observó ninguna petición atribuible a la acción.
-    NoRequest { reason: String },
-}
+const SNAPSHOT_JS: &str = include_str!("snapshot.js");
 
 /// Chromium headless controlado por CDP.
 pub struct Chrome {
@@ -157,6 +135,122 @@ impl Chrome {
         generation: u32,
         provenance: Provenance,
     ) -> Result<ActionDescriptor> {
+        let expression = format!(
+            "({})({})",
+            EXTRACT_JS,
+            serde_json::to_string(selector).expect("selector serializable")
+        );
+        let text = self.evaluate_isolated(&expression).await?;
+
+        let value: Value = serde_json::from_str(&text).context("JSON de extracción inválido")?;
+        if let Some(error) = value.get("error").and_then(Value::as_str) {
+            bail!("extracción: {error} (selector {selector:?})");
+        }
+        let raw: RawAction = serde_json::from_value(value).context("RawAction inválido")?;
+        Ok(ActionDescriptor::from_raw(raw, provenance, generation))
+    }
+
+    /// Foto de los elementos accionables, con refs `@eN` ligadas a `generation`.
+    pub async fn snapshot(&mut self, generation: u32) -> Result<Snapshot> {
+        let text = self
+            .evaluate_isolated(&format!("({SNAPSHOT_JS})()"))
+            .await?;
+        let value: Value = serde_json::from_str(&text).context("JSON de snapshot inválido")?;
+
+        let url = value
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let title = value
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let page_text = value
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        let raw_elements = value
+            .get("elements")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        let mut elements = Vec::with_capacity(raw_elements.len());
+        for (index, raw) in raw_elements.iter().enumerate() {
+            let selector = raw
+                .get("selector")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if selector.is_empty() {
+                continue;
+            }
+            elements.push(ElementRef {
+                reference: format!("@e{}", index + 1),
+                generation,
+                selector: selector.to_string(),
+                role: raw
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .unwrap_or("clickable")
+                    .to_string(),
+                name: raw
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                tag: raw
+                    .get("tag")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                x: raw.get("x").and_then(Value::as_f64).unwrap_or(0.0),
+                y: raw.get("y").and_then(Value::as_f64).unwrap_or(0.0),
+                disabled: raw
+                    .get("disabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            });
+        }
+
+        Ok(Snapshot {
+            generation,
+            url,
+            title,
+            elements,
+            text: page_text,
+        })
+    }
+
+    pub async fn read_text(&mut self) -> Result<String> {
+        let text = self
+            .evaluate_isolated("document.body ? document.body.innerText : ''")
+            .await?;
+        let value: Value =
+            serde_json::from_str(&text).context("el texto de la página no es JSON")?;
+        Ok(value.as_str().unwrap_or_default().to_string())
+    }
+
+    pub async fn screenshot(&mut self) -> Result<Vec<u8>> {
+        let response = self
+            .cdp
+            .call("Page.captureScreenshot", json!({ "format": "png" }))
+            .await?;
+        let data = response
+            .get("data")
+            .and_then(Value::as_str)
+            .context("la captura no devolvió datos")?;
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .context("la captura no es base64 válido")
+    }
+
+    /// Evalúa en el mundo aislado y devuelve el valor como texto JSON.
+    async fn evaluate_isolated(&self, expression: &str) -> Result<String> {
         let frame = self
             .cdp
             .call("Page.getFrameTree", json!({}))
@@ -180,11 +274,6 @@ impl Chrome {
             .and_then(Value::as_i64)
             .context("no se pudo crear el mundo aislado")?;
 
-        let expression = format!(
-            "({})({})",
-            EXTRACT_JS,
-            serde_json::to_string(selector).expect("selector serializable")
-        );
         let response = self
             .cdp
             .call(
@@ -199,20 +288,16 @@ impl Chrome {
             .await?;
 
         if let Some(details) = response.get("exceptionDetails") {
-            bail!("la extracción falló en JS: {details}");
+            bail!("la evaluación falló en JS: {details}");
         }
         let text = response
             .get("result")
             .and_then(|r| r.get("value"))
-            .and_then(Value::as_str)
-            .context("la extracción no devolvió un valor")?;
-
-        let value: Value = serde_json::from_str(text).context("JSON de extracción inválido")?;
-        if let Some(error) = value.get("error").and_then(Value::as_str) {
-            bail!("extracción: {error} (selector {selector:?})");
-        }
-        let raw: RawAction = serde_json::from_value(value).context("RawAction inválido")?;
-        Ok(ActionDescriptor::from_raw(raw, provenance, generation))
+            .context("la evaluación no devolvió un valor")?;
+        Ok(match text {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
     }
 
     /// Re-verifica el descriptor, hace click real e intercepta la petición
@@ -351,6 +436,43 @@ impl Chrome {
             )
             .await?;
         Ok(())
+    }
+}
+
+impl Engine for Chrome {
+    fn navigate(&mut self, url: &str) -> impl std::future::Future<Output = Result<()>> + Send {
+        Chrome::navigate(self, url)
+    }
+
+    fn snapshot(
+        &mut self,
+        generation: u32,
+    ) -> impl std::future::Future<Output = Result<Snapshot>> + Send {
+        Chrome::snapshot(self, generation)
+    }
+
+    fn extract(
+        &self,
+        selector: &str,
+        generation: u32,
+        provenance: Provenance,
+    ) -> impl std::future::Future<Output = Result<ActionDescriptor>> + Send {
+        Chrome::extract(self, selector, generation, provenance)
+    }
+
+    fn dispatch(
+        &mut self,
+        approved: &ActionDescriptor,
+    ) -> impl std::future::Future<Output = Result<DispatchOutcome>> + Send {
+        Chrome::dispatch(self, approved)
+    }
+
+    fn screenshot(&mut self) -> impl std::future::Future<Output = Result<Vec<u8>>> + Send {
+        Chrome::screenshot(self)
+    }
+
+    fn read_text(&mut self) -> impl std::future::Future<Output = Result<String>> + Send {
+        Chrome::read_text(self)
     }
 }
 

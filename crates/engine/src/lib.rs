@@ -1,0 +1,141 @@
+//! Interfaz de motor y modelo de snapshot.
+//!
+//! El motor solo observa y ejecuta. Todo lo que decide (política, tarjeta,
+//! recibo) vive fuera. El trait permite que `SessionCore` y el servidor MCP no
+//! sepan si debajo hay Chromium, Servo o un motor falso de test.
+
+use std::future::Future;
+
+use descriptor::{ActionDescriptor, Provenance};
+use serde::{Deserialize, Serialize};
+
+/// Resultado de intentar ejecutar una acción aprobada.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum DispatchOutcome {
+    /// La petición coincidía con lo aprobado y se dejó salir.
+    Sent {
+        url: String,
+        method: String,
+        body: Option<String>,
+    },
+    /// El DOM cambió entre la aprobación y el despacho: no se hizo click.
+    RejectedBeforeDispatch {
+        approved_hash: String,
+        observed_hash: String,
+    },
+    /// Se hizo click, pero la petición interceptada no era la aprobada.
+    Blocked {
+        url: String,
+        method: String,
+        body: Option<String>,
+        reason: String,
+    },
+    /// No se observó ninguna petición atribuible a la acción.
+    NoRequest { reason: String },
+}
+
+/// Un elemento accionable del snapshot.
+///
+/// `reference` es `@eN` y solo es válida dentro de su `generation`. El
+/// `selector` es la ruta CSS con la que el motor vuelve a encontrar el
+/// elemento; en `act` se comprueba que sigue siendo el mismo (tag, nombre y
+/// posición) antes de construir el descriptor.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ElementRef {
+    pub reference: String,
+    pub generation: u32,
+    pub selector: String,
+    pub role: String,
+    pub name: String,
+    pub tag: String,
+    pub x: f64,
+    pub y: f64,
+    pub disabled: bool,
+}
+
+impl ElementRef {
+    /// Dos elementos son el mismo si coinciden en identidad y posición.
+    pub fn same_element(&self, tag: &str, name: &str, x: f64, y: f64) -> bool {
+        const POSITION_TOLERANCE: f64 = 2.0;
+        self.tag.eq_ignore_ascii_case(tag)
+            && normalize(&self.name) == normalize(name)
+            && (self.x - x).abs() <= POSITION_TOLERANCE
+            && (self.y - y).abs() <= POSITION_TOLERANCE
+    }
+}
+
+fn normalize(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// Foto de la página en una generación concreta.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub generation: u32,
+    pub url: String,
+    pub title: String,
+    pub elements: Vec<ElementRef>,
+    pub text: String,
+}
+
+impl Snapshot {
+    pub fn find(&self, reference: &str) -> Option<&ElementRef> {
+        self.elements
+            .iter()
+            .find(|element| element.reference == reference)
+    }
+
+    /// Render de texto: lo que ve el agente en MCP y lo que se imprime en CLI.
+    pub fn render_text(&self) -> String {
+        let mut out = format!(
+            "generación {} · {} · {}\n",
+            self.generation,
+            self.url,
+            if self.title.is_empty() {
+                "(sin título)"
+            } else {
+                &self.title
+            }
+        );
+        for element in &self.elements {
+            out.push_str(&format!(
+                "{}  {:<9} {}{}\n",
+                element.reference,
+                element.role,
+                if element.name.is_empty() {
+                    "(sin nombre)"
+                } else {
+                    &element.name
+                },
+                if element.disabled { "  [deshabilitado]" } else { "" }
+            ));
+        }
+        out
+    }
+}
+
+/// El motor mínimo que la sesión necesita.
+pub trait Engine {
+    fn navigate(&mut self, url: &str) -> impl Future<Output = anyhow::Result<()>> + Send;
+
+    fn snapshot(&mut self, generation: u32) -> impl Future<Output = anyhow::Result<Snapshot>> + Send;
+
+    fn extract(
+        &self,
+        selector: &str,
+        generation: u32,
+        provenance: Provenance,
+    ) -> impl Future<Output = anyhow::Result<ActionDescriptor>> + Send;
+
+    fn dispatch(
+        &mut self,
+        approved: &ActionDescriptor,
+    ) -> impl Future<Output = anyhow::Result<DispatchOutcome>> + Send;
+
+    /// PNG de la vista actual.
+    fn screenshot(&mut self) -> impl Future<Output = anyhow::Result<Vec<u8>>> + Send;
+
+    /// Texto visible de la página, sin interpretar.
+    fn read_text(&mut self) -> impl Future<Output = anyhow::Result<String>> + Send;
+}

@@ -16,6 +16,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use signature::Signer;
 
+mod log;
+
+pub use log::{GENESIS, LOG_SCHEMA, LogEntry, LogError, ReceiptLog, verify_file};
+
 pub const RECEIPT_SCHEMA: &str = "navegador.receipt/1";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

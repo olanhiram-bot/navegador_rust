@@ -2,9 +2,12 @@
 resolver = "3"
 members = [
     "crates/descriptor",
+    "crates/engine",
     "crates/engine-cdp",
     "crates/receipt",
     "crates/card",
+    "crates/session",
+    "crates/mcp",
     "crates/navegador",
 ]
 
@@ -15,6 +18,7 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 anyhow = "1"
+base64 = "0.22"
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 ed25519-dalek = { version = "3", features = ["signature"] }
 futures-util = "0.3"

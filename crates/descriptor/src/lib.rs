@@ -276,7 +276,9 @@ pub fn canonical_json(value: &Value) -> String {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Intent {
     pub provenance: Provenance,
-    pub verb: Verb,
+    /// Verbo esperado. `None` significa "el que haga el elemento"; la tarjeta
+    /// muestra el real y la política lo comprueba igual.
+    pub verb: Option<Verb>,
     pub amount: Option<f64>,
     pub recipient: Option<String>,
     /// Orígenes donde esta intención puede ejecutarse.
@@ -337,10 +339,12 @@ impl Intent {
         if !d.hash_is_valid() {
             deny.push("el descriptor no coincide con su propio hash".into());
         }
-        if d.verb != self.verb {
+        if let Some(want) = self.verb
+            && d.verb != want
+        {
             deny.push(format!(
                 "la acción observada es {} pero la intención era {}",
-                d.verb, self.verb
+                d.verb, want
             ));
         }
         match &d.action_origin {
