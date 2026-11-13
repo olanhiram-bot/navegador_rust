@@ -19,5 +19,6 @@ tokio.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+session = { path = "../session" }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "time", "net", "sync", "io-util"] }

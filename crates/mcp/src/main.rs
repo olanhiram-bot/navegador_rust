@@ -15,7 +15,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use mcp::McpServer;
 use serde_json::{Value, json};
-use session::SessionConfig;
+use session::{OriginPolicy, SessionConfig};
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
@@ -117,6 +117,8 @@ fn stdin_lines() -> mpsc::UnboundedReceiver<std::io::Result<String>> {
 fn parse_args() -> Result<(PathBuf, SessionConfig)> {
     let mut log_path = PathBuf::from("navegador-recibos.jsonl");
     let mut config = SessionConfig::default();
+    let mut read_origins = Vec::new();
+    let mut write_origins = Vec::new();
     let mut args = std::env::args().skip(1);
 
     while let Some(arg) = args.next() {
@@ -136,9 +138,15 @@ fn parse_args() -> Result<(PathBuf, SessionConfig)> {
                     .extra_allowed_origins
                     .push(args.next().context("--allow-origin necesita un origen")?);
             }
+            "--read-origin" => {
+                read_origins.push(args.next().context("--read-origin necesita un origen")?)
+            }
+            "--write-origin" => {
+                write_origins.push(args.next().context("--write-origin necesita un origen")?)
+            }
             "--help" | "-h" => {
                 println!(
-                    "uso: navegador-mcp [--log RUTA] [--max-amount N] [--allow-origin ORIGEN]..."
+                    "uso: navegador-mcp [--log RUTA] [--max-amount N] [--allow-origin ORIGEN]... [--read-origin ORIGEN]... [--write-origin ORIGEN]..."
                 );
                 std::process::exit(0);
             }
@@ -148,6 +156,14 @@ fn parse_args() -> Result<(PathBuf, SessionConfig)> {
 
     if config.max_amount <= 0.0 {
         bail!("--max-amount debe ser positivo");
+    }
+    // Declarar una lista convierte la sesión en allowlist: lo que no está en
+    // `read` no se abre y lo que no está en `write` no recibe datos.
+    if !read_origins.is_empty() || !write_origins.is_empty() {
+        config.policy = OriginPolicy::Allowlist {
+            read: read_origins,
+            write: write_origins,
+        };
     }
     Ok((log_path, config))
 }

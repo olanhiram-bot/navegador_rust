@@ -78,6 +78,12 @@ impl Chrome {
         self.port
     }
 
+    /// Perfil efímero de esta instancia. Vive en un directorio temporal y se
+    /// borra al dropear el motor.
+    pub fn profile_dir(&self) -> &std::path::Path {
+        self._profile.path()
+    }
+
     pub fn pid(&self) -> Option<u32> {
         self.child.id()
     }

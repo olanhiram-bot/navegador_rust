@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="es">
+<head><meta charset="utf-8"><title>Reserva</title></head>
+<body>
+  <h1>Reservar mesa</h1>
+  <p>Mesa para 2 personas el 1 de diciembre.</p>
+  <form id="booking" action="{{PAGE}}/booking" method="POST">
+    <input name="date" type="hidden" value="2026-12-01">
+    <input name="people" type="hidden" value="2">
+    <button id="book" type="submit">Reservar mesa</button>
+  </form>
+</body>
+</html>

@@ -23,6 +23,24 @@ use descriptor::{ActionDescriptor, Decision, Intent, Provenance};
 use engine::{DispatchOutcome, ElementRef, Engine, Snapshot};
 use receipt::{Identity, Receipt, ReceiptLog, WireRequest};
 
+/// Qué orígenes puede leer y a cuáles puede enviar datos la sesión.
+///
+/// Un origen en `read` y no en `write` es de solo lectura: se puede abrir,
+/// leer y capturar, pero cualquier acción que envíe datos allí se deniega.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OriginPolicy {
+    /// Cualquier documento visitado se puede leer; las acciones solo pueden ir
+    /// a orígenes ya visitados en la sesión (comportamiento del MVP).
+    Visited,
+    /// Solo los orígenes declarados: `read` para abrir y leer, `write` para
+    /// actuar. Es también la lista de egreso: una acción cuyo destino no esté
+    /// en `write` se deniega antes del click.
+    Allowlist {
+        read: Vec<String>,
+        write: Vec<String>,
+    },
+}
+
 /// Política de la sesión. El importe y el destinatario concretos se pasan en
 /// cada `act`; aquí viven los límites que no cambian.
 #[derive(Debug, Clone, PartialEq)]
@@ -30,6 +48,7 @@ pub struct SessionConfig {
     pub provenance: Provenance,
     pub max_amount: f64,
     pub require_approval: bool,
+    pub policy: OriginPolicy,
     /// Orígenes permitidos además de los documentos visitados en la sesión.
     pub extra_allowed_origins: Vec<String>,
 }
@@ -40,6 +59,7 @@ impl Default for SessionConfig {
             provenance: Provenance::User,
             max_amount: 100.0,
             require_approval: true,
+            policy: OriginPolicy::Visited,
             extra_allowed_origins: Vec::new(),
         }
     }
@@ -75,6 +95,8 @@ pub enum SessionError {
     },
     #[error("el elemento de {0} cambió desde el snapshot; pide uno nuevo")]
     ElementChanged(String),
+    #[error("origen no permitido para lectura: {origin}")]
+    OriginNotReadable { origin: String },
     #[error("el motor falló: {0}")]
     Engine(#[from] anyhow::Error),
     #[error("el recibo no verifica: {0}")]
@@ -243,7 +265,21 @@ impl<E: Engine> Session<E> {
     }
 
     /// Navega, abre una generación nueva y devuelve el snapshot ya listo.
+    ///
+    /// Con `OriginPolicy::Allowlist` la navegación se deniega si el origen no
+    /// está en la lista de lectura.
     pub async fn open(&mut self, url: &str) -> Result<Snapshot, SessionError> {
+        if let OriginPolicy::Allowlist { read, .. } = &self.config.policy {
+            match origin_of(url) {
+                Some(origin) if read.contains(&origin) => {}
+                Some(origin) => return Err(SessionError::OriginNotReadable { origin }),
+                None => {
+                    return Err(SessionError::OriginNotReadable {
+                        origin: url.to_string(),
+                    });
+                }
+            }
+        }
         self.engine.navigate(url).await?;
         self.generation += 1;
         self.url = url.to_string();
@@ -312,12 +348,16 @@ impl<E: Engine> Session<E> {
             return Err(SessionError::ElementChanged(reference));
         }
 
+        let allowed_action_origins = match &self.config.policy {
+            OriginPolicy::Visited => self.allowed_origins.clone(),
+            OriginPolicy::Allowlist { write, .. } => write.clone(),
+        };
         let intent = Intent {
             provenance: self.config.provenance,
             verb: None,
             amount: options.amount,
             recipient: options.recipient.clone(),
-            allowed_action_origins: self.allowed_origins.clone(),
+            allowed_action_origins,
             max_amount: self.config.max_amount,
             require_approval: self.config.require_approval,
         };
@@ -415,16 +455,18 @@ impl<E: Engine> Session<E> {
     }
 
     fn note_origin(&mut self, url: &str) {
-        let Some(origin) = url::Url::parse(url).ok().and_then(|parsed| {
-            let origin = parsed.origin();
-            origin.is_tuple().then(|| origin.ascii_serialization())
-        }) else {
+        let Some(origin) = origin_of(url) else {
             return;
         };
         if !self.allowed_origins.contains(&origin) {
             self.allowed_origins.push(origin);
         }
     }
+}
+
+fn origin_of(url: &str) -> Option<String> {
+    let origin = url::Url::parse(url).ok()?.origin();
+    origin.is_tuple().then(|| origin.ascii_serialization())
 }
 
 fn normalize_reference(reference: &str) -> String {

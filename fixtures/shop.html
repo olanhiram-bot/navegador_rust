@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="es">
+<head><meta charset="utf-8"><title>Finalizar compra</title></head>
+<body>
+  <h1>Finalizar compra</h1>
+  <p id="summary">Pedido: 2 × Café — total $24.90</p>
+  <form id="checkout" action="{{PAGE}}/order" method="POST">
+    <input name="to" type="hidden" value="ana">
+    <input name="amount" type="hidden" value="24.90">
+    <input name="sku" type="hidden" value="cafe-1kg">
+    <input name="qty" type="hidden" value="2">
+    <button id="pay" type="submit">Pagar $24.90</button>
+  </form>
+</body>
+</html>
