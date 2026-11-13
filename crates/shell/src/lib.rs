@@ -1,10 +1,12 @@
-//! Shell mínima: la página visible, una barra de dirección y el handoff.
+//! Shell mínima: pestañas, página visible, omnibox, tarjeta y panel del agente.
 //!
 //! La UI corre en el hilo de eframe; Chromium y su runtime de Tokio viven en un
-//! hilo aparte y se hablan por canales. La shell es de solo lectura: muestra la
-//! página y permite navegar, pero no hace click en controles de formulario.
-//! Las acciones consecuentes siguen pasando por descriptor → tarjeta → recibo
-//! en la sesión/MCP, nunca por píxeles.
+//! hilo aparte y se hablan por canales. Cada pestaña es una `Session<Chrome>`.
+//!
+//! Un click en la página no se reenvía: se hace hit-test en el mundo aislado,
+//! se cruza con el snapshot vivo para obtener la ref `@eN` y se llama a
+//! `Session::act`. La acción ejecutada pasa por descriptor → política → tarjeta
+//! → recibo, nunca por píxeles.
 
 pub mod app;
 pub mod engine;

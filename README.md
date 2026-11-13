@@ -11,8 +11,10 @@ deja un recibo firmado que se verifica offline. Un host MCP completa un flujo de
 `open` → `snapshot` → `act` por stdio. La fase 4 añade política de orígenes
 read-only/read-write, perfiles efímeros y 3 escenarios locales con 0 falsos
 bloqueos; falta validarlos en sitios reales. La fase 5 ya tiene una **shell
-mínima**: página visible por screencast CDP, barra de dirección, scroll y panel
-de handoff; todavía es de solo lectura y no hay demo de 60 s grabado.
+mínima**: pestañas, página visible por screencast CDP, barra de dirección,
+scroll, acciones sobre botones con tarjeta modal y recibo, y panel del agente
+con generación, refs y handoff. Sin teclado hacia la página ni demo de 60 s
+grabado todavía.
 
 ## Cómo correrlo
 
@@ -58,7 +60,7 @@ crates/card/         Modelo de la tarjeta (testeable sin pantalla) + render egui
 crates/receipt/      Recibo ed25519 firmado, verificación offline y log encadenado
 crates/session/      SessionCore: refs, política de orígenes, tarjeta, dispatch y recibo
 crates/mcp/          Servidor MCP por stdio (open, snapshot, act, read, screenshot, handoff)
-crates/shell/        Shell egui: screencast de la página, omnibox y handoff
+crates/shell/        Shell egui: pestañas, screencast, omnibox, tarjeta y panel del agente
 crates/navegador/    Servidor de fixtures, CLI y arnés de ataques
 fixtures/            exfil, lie-in-the-loop, sustitución y tarea legítima
 docs/                investigación, tesis y plan

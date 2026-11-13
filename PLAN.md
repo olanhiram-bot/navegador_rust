@@ -86,11 +86,12 @@ acciones, no todos los subrecursos de la página; ese es el límite declarado.
 ### Fase 5 — Shell (semanas 7–8) — **en curso**
 
 - GPUI o egui: pestañas, omnibox, panel del agente, handoff.
-  **Hecho:** shell egui con página visible por screencast CDP, omnibox, scroll y
-  panel de handoff; sigue el principio de solo lectura (no hace click en
-  controles de formulario).
-  **Pendiente:** pestañas, panel del agente conectado, acciones desde la shell
-  pasando por tarjeta, y el demo de 60 s grabado.
+  **Hecho:** shell egui con página visible por screencast CDP, omnibox, scroll,
+  pestañas (una sesión por pestaña), acciones desde la shell con hit-test →
+  `Session::act` → tarjeta modal → recibo, y panel del agente con generación,
+  refs, recibos y handoff.
+  **Pendiente:** teclado hacia la página, clicks en enlaces, conexión real del
+  agente por proceso y el demo de 60 s grabado.
 - Gate: el demo de 60 segundos grabado de punta a punta. **Pendiente.**
 
 ### Fase 6 — Servo (post-MVP)

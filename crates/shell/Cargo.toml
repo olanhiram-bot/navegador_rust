@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 base64.workspace = true
+card = { path = "../card" }
 eframe.workspace = true
 engine-cdp = { path = "../engine-cdp" }
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
