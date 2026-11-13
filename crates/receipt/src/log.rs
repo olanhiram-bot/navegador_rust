@@ -90,6 +90,10 @@ impl ReceiptLog {
         &self.entries
     }
 
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn last_receipt(&self) -> Option<&Receipt> {
         self.entries.last().map(|entry| &entry.receipt)
     }
