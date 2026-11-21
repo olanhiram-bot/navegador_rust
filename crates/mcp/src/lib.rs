@@ -235,6 +235,11 @@ fn outcome_json(outcome: &ActOutcome) -> Value {
             "dispatch": outcome,
             "card": card::render_text(card),
         }),
+        ActOutcome::LocalInteraction { descriptor } => json!({
+            "outcome": "local_interaction",
+            "hash": descriptor.hash_hex,
+            "note": "botón que solo ejecuta JavaScript; no hubo tarjeta ni petición observada",
+        }),
         ActOutcome::NotExecuted {
             descriptor,
             outcome,

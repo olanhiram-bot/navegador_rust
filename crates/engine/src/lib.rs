@@ -261,6 +261,11 @@ pub trait Engine {
         async { Ok(()) }
     }
 
+    /// Interacción local sin petición (botones que solo ejecutan JavaScript).
+    fn interact(&self, _x: f64, _y: f64) -> impl Future<Output = anyhow::Result<()>> + Send {
+        async { Ok(()) }
+    }
+
     /// Busca texto en la página y resalta las coincidencias.
     fn find(
         &self,

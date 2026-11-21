@@ -1056,3 +1056,47 @@ fn tres_recorridos_locales_comparar_rellenar_y_reservar() {
     );
     handle.shutdown();
 }
+
+#[test]
+fn un_boton_que_solo_ejecuta_javascript_es_interaccion_local() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("puerto local");
+    let base = format!(
+        "http://127.0.0.1:{}/",
+        listener.local_addr().unwrap().port()
+    );
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buffer = [0u8; 2048];
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            let _ = read;
+            let body = "<title>JS</title><body><button onclick=\"document.body.dataset.pulsado='1'\">Cambiar</button></body>";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let handle = spawn(base, dir.path().join("log"));
+    let (_, elements) = first_snapshot(&handle);
+    let button = elements
+        .iter()
+        .find(|element| element.role == "button")
+        .expect("botón");
+    handle.click(button.x, button.y);
+    wait_for(&handle, 30, |event| {
+        matches!(
+            event,
+            Event::Act {
+                outcome: ActOutcome::LocalInteraction { .. },
+                ..
+            }
+        )
+    });
+    handle.shutdown();
+}

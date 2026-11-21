@@ -113,8 +113,9 @@ copia parcheada en `vendor/xattr` aplicada con `[patch.crates-io]`.
 ## Limitaciones conocidas
 
 - Los botones que solo ejecutan JavaScript, sin formulario ni destino, se
-  bloquean por política: no se puede demostrar qué petición van a hacer. Los
-  enlaces, formularios y envíos con Enter sí pasan por tarjeta y recibo.
+  pulsan como **interacción local** para que los sitios respondan; no generan
+  tarjeta ni recibo porque no declaran petición. Enlaces, formularios y envíos
+  con Enter siguen pasando por tarjeta y recibo.
 - Las pestañas que abre la web (`window.open`, `target=_blank`) se adoptan como
   pestañas de la shell, pero los diálogos nativos de Chromium (selectores,
   subida de archivos, alertas) no se ven en la vista por screencast.

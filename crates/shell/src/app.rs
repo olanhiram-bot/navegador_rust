@@ -365,6 +365,9 @@ impl ShellApp {
                     } else {
                         self.pending = None;
                         self.status = match &outcome {
+                            ActOutcome::LocalInteraction { .. } => {
+                                "interacción local (sin petición)".into()
+                            }
                             ActOutcome::Executed { seq, .. } => {
                                 format!("acción ejecutada · recibo {seq}")
                             }

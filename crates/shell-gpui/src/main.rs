@@ -257,6 +257,10 @@ impl Shell {
                             self.pending = Some((hash.clone(), card.clone()));
                             self.status = "esperando tu aprobación".into();
                         }
+                        session::ActOutcome::LocalInteraction { .. } => {
+                            self.pending = None;
+                            self.status = "interacción local (sin petición)".into();
+                        }
                         other => {
                             self.pending = None;
                             self.result = Some(other.render_text());
@@ -507,6 +511,15 @@ impl Shell {
             return;
         }
         let (x, y) = self.page_css(event.position);
+        if std::env::var_os("NAVEGADOR_CLICK_LOG").is_some() {
+            eprintln!(
+                "clic ventana=({:.0},{:.0}) css=({x:.1},{y:.1}) pagina={:?} css_size={:?}",
+                f32::from(event.position.x),
+                f32::from(event.position.y),
+                self.page_size,
+                self.css
+            );
+        }
         if x >= 0.0 && y >= 0.0 {
             self.handle.click(x, y);
         }

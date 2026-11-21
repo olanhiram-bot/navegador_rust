@@ -134,6 +134,8 @@ pub enum ActOutcome {
         descriptor: ActionDescriptor,
         outcome: DispatchOutcome,
     },
+    /// Botón que solo ejecuta JavaScript: se pulsó como interacción local.
+    LocalInteraction { descriptor: ActionDescriptor },
 }
 
 impl ActOutcome {
@@ -171,6 +173,12 @@ impl ActOutcome {
                     receipt.descriptor.hash_hex
                 ));
                 out
+            }
+            ActOutcome::LocalInteraction { descriptor } => {
+                format!(
+                    "interacción local sin petición\n  descriptor: {}\n",
+                    descriptor.hash_hex
+                )
             }
             ActOutcome::NotExecuted {
                 descriptor,
@@ -390,6 +398,20 @@ impl<E: Engine> Session<E> {
         let view = card::build(&observed, &decision);
 
         match &decision {
+            Decision::Deny { reasons }
+                if reasons
+                    == &vec!["no se pudo resolver el origen real de la acción".to_string()] =>
+            {
+                // Un botón que solo ejecuta JavaScript no declara destino; se
+                // pulsa como interacción local. Si dispara red, no hay tarjeta.
+                self.engine
+                    .interact(observed.target.x, observed.target.y)
+                    .await?;
+                self.refresh();
+                return Ok(ActOutcome::LocalInteraction {
+                    descriptor: observed,
+                });
+            }
             Decision::Deny { .. } => {
                 return Ok(ActOutcome::Denied {
                     descriptor: observed,

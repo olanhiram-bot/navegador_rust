@@ -1239,6 +1239,10 @@ impl Engine for Chrome {
     ) -> impl std::future::Future<Output = Result<Option<String>>> + Send {
         Chrome::link_target(self, selector)
     }
+
+    fn interact(&self, x: f64, y: f64) -> impl std::future::Future<Output = Result<()>> + Send {
+        Chrome::click_at(self, x, y)
+    }
 }
 
 impl engine::Transport for Chrome {
