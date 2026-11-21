@@ -100,7 +100,15 @@ struct Shell {
 
 impl Shell {
     fn new(cx: &mut Context<Self>, initial_urls: Vec<String>, paths: estado::Paths) -> Self {
-        let profile = estado::data_dir().map(|dir| dir.join("perfil"));
+        // En modo nativo se usa un perfil aparte: la instancia normal puede
+        // tener el perfil principal bloqueado.
+        let profile = estado::data_dir().map(|dir| {
+            if native_mode() {
+                dir.join("perfil-nativo")
+            } else {
+                dir.join("perfil")
+            }
+        });
         let log_path = estado::state_dir()
             .map(|dir| dir.join("recibos.jsonl"))
             .unwrap_or_else(|| PathBuf::from("navegador-recibos.jsonl"));
