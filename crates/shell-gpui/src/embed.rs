@@ -1,14 +1,13 @@
-//! Coloca la ventana de Chromium encima del área de página de la shell.
+//! Incrusta la ventana de Chromium con una ventana contenedora propia.
 //!
-//! GPUI no expone el XID de su ventana (su backend X11 no implementa
-//! `HasWindowHandle`), así que en vez de reparentar se usa una ventana X11
-//! superpuesta: se marca Chromium como `override_redirect` (el compositor deja
-//! de gestionarla), se coloca en coordenadas absolutas sobre la shell y se
-//! mantiene al frente. La shell encuentra su propia ventana por WM_CLASS.
+//! En X11/XWayland se crea una ventana `override-redirect` encima del área de
+//! página de la shell y se reparenta dentro el cliente de Chromium. Así el
+//! gestor de ventanas no toca ninguna de las dos y la página se dibuja de
+//! forma nativa (sin JPEG).
 
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
 use x11rb::rust_connection::RustConnection;
@@ -16,69 +15,101 @@ use x11rb::rust_connection::RustConnection;
 pub struct Embed {
     conn: RustConnection,
     child: Window,
+    container: Window,
     shell: Window,
     bounds: (i16, i16, u16, u16),
-    absolute: (i16, i16),
-    last_shell: Instant,
+    last_move: Instant,
     visible: bool,
 }
 
 impl Embed {
+    /// Busca la shell y Chromium, crea el contenedor y reparenta el cliente.
     pub fn attach(pid: u32) -> Result<Self> {
         let (conn, screen) = RustConnection::connect(None).context("conectar a X11")?;
         let root = conn.setup().roots[screen].root;
+        let shell = find_window(&conn, root, 0, "navegador")
+            .context("no se encontró la ventana de la shell (¿X11?)")?;
         let child = find_window(&conn, root, pid, "chromium")
             .context("no se encontró la ventana de Chromium")?;
-        let shell = find_window(&conn, root, 0, "navegador")
-            .context("no se encontró la ventana de la shell")?;
 
-        // Fuera del gestor de ventanas: se coloca a mano sobre la shell.
-        conn.unmap_window(child).ok();
-        conn.change_window_attributes(
-            child,
-            &ChangeWindowAttributesAux::new().override_redirect(1),
+        let container = conn.generate_id().context("generar id X11")?;
+        conn.create_window(
+            x11rb::COPY_DEPTH_FROM_PARENT,
+            container,
+            root,
+            0,
+            0,
+            100,
+            100,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            x11rb::COPY_FROM_PARENT,
+            &CreateWindowAux::new()
+                .override_redirect(1)
+                .background_pixel(0x00101114)
+                .event_mask(EventMask::EXPOSURE),
         )
-        .context("marcar Chromium como override-redirect")?;
+        .context("crear el contenedor X11")?;
+
+        // El gestor puede haber envuelto a Chromium en un marco: se oculta para
+        // que no quede un cascarón vacío.
+        if let Ok(cookie) = conn.query_tree(child)
+            && let Ok(tree) = cookie.reply()
+            && tree.parent != root
+        {
+            conn.unmap_window(tree.parent).ok();
+        }
+        conn.unmap_window(child).ok();
+        conn.reparent_window(child, container, 0, 0)
+            .context("reparentar Chromium en el contenedor")?;
         conn.map_window(child).ok();
-        conn.flush().ok();
+        conn.map_window(container).ok();
+        conn.flush().context("volcar X11")?;
 
         Ok(Self {
             conn,
             child,
+            container,
             shell,
             bounds: (0, 0, 1, 1),
-            absolute: (0, 0),
-            last_shell: Instant::now(),
+            last_move: Instant::now(),
             visible: true,
         })
     }
 
-    /// Coloca Chromium en coordenadas relativas a la shell y la trae al frente.
+    /// Coloca el contenedor sobre el área de página (coordenadas de la shell).
     pub fn place(&mut self, x: i16, y: i16, width: u16, height: u16) {
-        if (x, y, width, height) == self.bounds && self.last_shell.elapsed() < Duration::from_millis(250)
+        if (x, y, width, height) == self.bounds
+            && self.last_move.elapsed() < Duration::from_millis(200)
         {
             return;
         }
         self.bounds = (x, y, width, height);
-        self.last_shell = Instant::now();
-        let shell = self
+        self.last_move = Instant::now();
+        let origin = self
             .conn
-            .get_geometry(self.shell)
+            .translate_coordinates(self.shell, self.conn.setup().roots[0].root, 0, 0)
             .ok()
             .and_then(|cookie| cookie.reply().ok())
-            .map(|geometry| (geometry.x, geometry.y))
-            .unwrap_or(self.absolute);
-        self.absolute = shell;
-        let absolute_x = shell.0.saturating_add(x);
-        let absolute_y = shell.1.saturating_add(y);
+            .map(|reply| (reply.dst_x, reply.dst_y))
+            .unwrap_or((0, 0));
+        let absolute_x = origin.0.saturating_add(x);
+        let absolute_y = origin.1.saturating_add(y);
+
         let _ = self.conn.configure_window(
-            self.child,
+            self.container,
             &ConfigureWindowAux::new()
                 .x(i32::from(absolute_x))
                 .y(i32::from(absolute_y))
                 .width(u32::from(width))
                 .height(u32::from(height))
                 .stack_mode(StackMode::ABOVE),
+        );
+        let _ = self.conn.configure_window(
+            self.child,
+            &ConfigureWindowAux::new()
+                .width(u32::from(width))
+                .height(u32::from(height)),
         );
         let _ = self.conn.flush();
     }
@@ -89,12 +120,24 @@ impl Embed {
         }
         self.visible = visible;
         if visible {
-            let _ = self.conn.map_window(self.child);
+            let _ = self.conn.map_window(self.container);
+            let _ = self.conn.configure_window(
+                self.container,
+                &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+            );
         } else {
-            let _ = self.conn.unmap_window(self.child);
+            let _ = self.conn.unmap_window(self.container);
         }
         let _ = self.conn.flush();
     }
+}
+
+fn class_of(conn: &RustConnection, win: Window) -> String {
+    conn.get_property(false, win, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 256)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        .map(|reply| String::from_utf8_lossy(&reply.value).to_lowercase())
+        .unwrap_or_default()
 }
 
 fn find_window(conn: &RustConnection, root: Window, pid: u32, class: &str) -> Result<Window> {
@@ -107,12 +150,7 @@ fn find_window(conn: &RustConnection, root: Window, pid: u32, class: &str) -> Re
     let tree = conn.query_tree(root).context("query_tree")?.reply()?;
     let mut fallback = None;
     for &win in &tree.children {
-        let wm_class = conn
-            .get_property(false, win, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 256)
-            .ok()
-            .and_then(|cookie| cookie.reply().ok())
-            .map(|reply| String::from_utf8_lossy(&reply.value).to_lowercase())
-            .unwrap_or_default();
+        let wm_class = class_of(conn, win);
         if !wm_class.contains(class) {
             continue;
         }
@@ -128,8 +166,5 @@ fn find_window(conn: &RustConnection, root: Window, pid: u32, class: &str) -> Re
         }
         fallback = Some(win);
     }
-    match fallback {
-        Some(win) => Ok(win),
-        None => bail!("ventana «{class}» no encontrada"),
-    }
+    fallback.with_context(|| format!("no se encontró la ventana «{class}» (pid {pid})"))
 }

@@ -1858,16 +1858,8 @@ fn native_mode() -> bool {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--nativo") {
-        // Debe fijarse antes de crear el motor, que lee la variable.
-        unsafe { std::env::set_var("NAVEGADOR_NATIVO", "1200x800") };
-    }
-    if args.iter().any(|arg| arg == "--version" || arg == "-V") {
-        println!("navegador-gpui {}", env!("CARGO_PKG_VERSION"));
-        return;
-    }
-    if args.iter().any(|arg| arg == "--nativo") {
-        // Chromium corre en el X11 del escritorio con una ventana `--app`;
-        // la shell la incrusta (requiere X11/XWayland).
+        // La incrustación necesita X11. Arranca con:
+        //   env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET navegador-gpui --nativo URL
         unsafe {
             std::env::set_var("NAVEGADOR_NATIVO", "1024x768");
         }
