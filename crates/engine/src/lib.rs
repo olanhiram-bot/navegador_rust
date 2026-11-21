@@ -242,6 +242,14 @@ pub trait Engine {
         async { Ok(None) }
     }
 
+    /// Valor de `target` del enlace que corresponde a un selector, si lo hay.
+    fn link_target(
+        &self,
+        _selector: &str,
+    ) -> impl Future<Output = anyhow::Result<Option<String>>> + Send {
+        async { Ok(None) }
+    }
+
     /// Fija permisos del origen: `granted` y `denied` son nombres de CDP
     /// (`notifications`, `geolocation`, `audioCapture`, `videoCapture`).
     fn set_permissions(

@@ -45,6 +45,11 @@ fn wait_for(
         {
             Ok(Event::Error(error)) => panic!("error del motor: {error}"),
             Ok(event) => {
+                if std::env::var_os("NAVEGADOR_TEST_DEBUG").is_some()
+                    && !matches!(event, Event::Frame { .. })
+                {
+                    eprintln!("evento: {event:?}");
+                }
                 if predicate(&event) {
                     return event;
                 }
@@ -715,5 +720,174 @@ fn una_descarga_llega_a_la_carpeta_y_avisa_al_terminar() {
         std::fs::read_to_string(&download.path).unwrap().trim(),
         "contenido de prueba"
     );
+    handle.shutdown();
+}
+
+#[test]
+fn un_enlace_con_target_blank_abre_pestana_nueva() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("puerto local");
+    let base = format!(
+        "http://127.0.0.1:{}/",
+        listener.local_addr().unwrap().port()
+    );
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buffer = [0u8; 2048];
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            let head = String::from_utf8_lossy(&buffer[..read]);
+            let path = head.split_whitespace().nth(1).unwrap_or("/");
+            let body = if path.starts_with("/dos") {
+                "<title>Dos</title><body>segunda</body>"
+            } else {
+                "<title>Uno</title><body><a href=\"/dos\" target=\"_blank\">Abrir dos</a></body>"
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let handle = spawn(base.clone(), dir.path().join("log"));
+    let (first, elements) = first_snapshot(&handle);
+    let link = elements
+        .iter()
+        .find(|element| element.role == "link")
+        .expect("el fixture tiene un enlace");
+    handle.click(link.x, link.y);
+    match wait_for(
+        &handle,
+        20,
+        |event| matches!(event, Event::TabOpened(info) if info.id != first && info.url.ends_with("/dos")),
+    ) {
+        Event::TabOpened(info) => {
+            assert_ne!(info.id, first, "la pestaña nueva debe ser otra");
+            assert!(info.url.ends_with("/dos"));
+        }
+        _ => unreachable!(),
+    }
+    handle.shutdown();
+}
+
+#[test]
+fn un_window_open_aparece_como_pestana() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("puerto local");
+    let base = format!(
+        "http://127.0.0.1:{}/",
+        listener.local_addr().unwrap().port()
+    );
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buffer = [0u8; 2048];
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            let head = String::from_utf8_lossy(&buffer[..read]);
+            let path = head.split_whitespace().nth(1).unwrap_or("/");
+            let body = if path.starts_with("/tres") {
+                "<title>Tres</title><body>popup</body>"
+            } else {
+                "<title>Uno</title><body><input id=q autofocus><script>q.addEventListener('keydown',e=>{if(e.key==='Enter')window.open('/tres','_blank')})</script></body>"
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let handle = spawn(base.clone(), dir.path().join("log"));
+    let (_, elements) = first_snapshot(&handle);
+    let field = elements
+        .iter()
+        .find(|element| element.role == "textbox")
+        .expect("el fixture tiene un campo");
+    handle.click(field.x, field.y);
+    wait_for(
+        &handle,
+        10,
+        |event| matches!(event, Event::Notice(notice) if notice.contains("enfocado")),
+    );
+    handle.key("Enter", "Enter", 13, 0);
+    // El popup lo abre la propia web; el motor lo adopta como pestaña.
+    wait_for(
+        &handle,
+        25,
+        |event| matches!(event, Event::Snapshot { info, .. } if info.url.ends_with("/tres")),
+    );
+    handle.shutdown();
+}
+
+#[test]
+fn el_clic_central_abre_en_segundo_plano_y_copia_el_enlace() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("puerto local");
+    let base = format!(
+        "http://127.0.0.1:{}/",
+        listener.local_addr().unwrap().port()
+    );
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buffer = [0u8; 2048];
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            let head = String::from_utf8_lossy(&buffer[..read]);
+            let path = head.split_whitespace().nth(1).unwrap_or("/");
+            let body = if path.starts_with("/dos") {
+                "<title>Dos</title><body>dos</body>"
+            } else {
+                "<title>Uno</title><body><a href=\"/dos\">Abrir dos</a></body>"
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let handle = spawn(base.clone(), dir.path().join("log"));
+    let (first, elements) = first_snapshot(&handle);
+    let link = elements
+        .iter()
+        .find(|element| element.role == "link")
+        .expect("enlace");
+
+    handle.copy_link(link.x, link.y);
+    wait_for(
+        &handle,
+        10,
+        |event| matches!(event, Event::CopyText(_, url) if url.ends_with("/dos")),
+    );
+
+    handle.open_link_new_tab(link.x, link.y, true);
+    let second = match wait_for(
+        &handle,
+        20,
+        |event| matches!(event, Event::TabOpened(info) if info.id != first && info.url.ends_with("/dos")),
+    ) {
+        Event::TabOpened(info) => info.id,
+        _ => unreachable!(),
+    };
+    // Al abrirse en segundo plano no debe cambiar la pestaña activa.
+    let deadline = Instant::now() + Duration::from_millis(800);
+    while Instant::now() < deadline {
+        match handle.events.recv_timeout(Duration::from_millis(100)) {
+            Ok(Event::Selected(Some(id))) => assert_ne!(id, second, "no debía seleccionarse"),
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
     handle.shutdown();
 }

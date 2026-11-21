@@ -45,9 +45,11 @@ cargo run -p shell -- https://ejemplo.com --log /tmp/recibos.jsonl
 # directorio; --sin-restaurar abre una pestaña en lugar de las de la última vez.
 cargo run -p shell -- --efimero https://ejemplo.com
 
-# atajos: Ctrl+T pestaña, Ctrl+W cerrar, Ctrl+R recargar, Ctrl+Q salir,
+# atajos: Ctrl+T pestaña, Ctrl+W cerrar, Ctrl+Shift+T deshacer cierre,
+# Ctrl+R recargar, Ctrl+Q salir, Ctrl+L barra de direcciones,
 # Ctrl+F buscar en la página, Ctrl++ / Ctrl+- / Ctrl+0 zoom del sitio,
-# Ctrl+D marcador, Ctrl+Shift+B marcadores, Ctrl+H historial
+# Ctrl+D marcador, Ctrl+Shift+B marcadores, Ctrl+H historial, Ctrl+, ajustes
+# clic central y clic derecho: abrir enlace aparte, copiar enlace, navegar
 # descargas: ~/Downloads o $NAVEGADOR_DESCARGAS
 # permisos por sitio y descargas: menú ☰ de la barra
 
@@ -83,6 +85,17 @@ del descriptor de forma no interactiva (útil para CI y scripts).
 `PATH`, la shell lanza Chromium headful dentro de un display virtual; así los
 sitios no lo detectan como navegador automatizado. `NAVEGADOR_HEADLESS=1`
 fuerza headless.
+
+## Limitaciones conocidas
+
+- Los botones que solo ejecutan JavaScript, sin formulario ni destino, se
+  bloquean por política: no se puede demostrar qué petición van a hacer. Los
+  enlaces, formularios y envíos con Enter sí pasan por tarjeta y recibo.
+- Las pestañas que abre la web (`window.open`, `target=_blank`) se adoptan como
+  pestañas de la shell, pero los diálogos nativos de Chromium (selectores,
+  subida de archivos, alertas) no se ven en la vista por screencast.
+- Sin Widevine no hay DRM; las notificaciones concedidas no llegan al escritorio
+  porque Chromium corre en un display virtual.
 
 ## Estructura
 

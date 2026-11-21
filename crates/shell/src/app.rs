@@ -78,6 +78,14 @@ pub struct ShellApp {
     history_open: bool,
     history_query: String,
     history_path: Option<PathBuf>,
+    settings_open: bool,
+    motor: String,
+    /// Dónde se dibujan las sugerencias del omnibox.
+    suggest_rect: Option<Rect>,
+    /// Pestañas cerradas, para Ctrl+Shift+T.
+    closed_tabs: Vec<String>,
+    /// Posición (CSS) del último clic derecho en la página.
+    context_at: Option<(f64, f64)>,
     /// Última página anotada, para no duplicar visitas seguidas.
     last_visit: String,
     /// Barra de búsqueda dentro de la página (Ctrl+F).
@@ -127,6 +135,7 @@ impl ShellApp {
         let zoom = settings.zoom;
         let permisos = settings.permisos;
         let bookmarks = settings.marcadores;
+        let motor = settings.motor;
         let history = paths
             .history
             .as_deref()
@@ -168,6 +177,11 @@ impl ShellApp {
             history_open: false,
             history_query: String::new(),
             history_path: paths.history.clone(),
+            settings_open: false,
+            motor,
+            suggest_rect: None,
+            closed_tabs: Vec::new(),
+            context_at: None,
             last_visit: String::new(),
             find_open: false,
             find_text: String::new(),
@@ -244,6 +258,14 @@ impl ShellApp {
                     }
                 }
                 Event::TabClosed(id) => {
+                    if let Some(tab) = self.tabs.iter().find(|tab| tab.id == id)
+                        && crate::estado::is_restorable(&tab.url)
+                    {
+                        self.closed_tabs.push(tab.url.clone());
+                        if self.closed_tabs.len() > 10 {
+                            self.closed_tabs.remove(0);
+                        }
+                    }
                     self.tabs.retain(|tab| tab.id != id);
                     self.frames.remove(&id);
                 }
@@ -464,7 +486,7 @@ impl ShellApp {
     }
 
     fn navigate(&mut self) {
-        let url = browser_url(&self.address);
+        let url = browser_url_with(&self.address, &self.motor);
         self.address = url.clone();
         self.status = format!("navegando a {url}…");
         self.handle.navigate(url);
@@ -616,6 +638,9 @@ impl ShellApp {
                             output.state.store(ui.ctx(), id);
                         }
                         let field = output.response;
+                        if field.has_focus() {
+                            self.suggest_rect = Some(field.rect);
+                        }
                         if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             submit = true;
                         }
@@ -1045,6 +1070,141 @@ impl ShellApp {
         }
     }
 
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        let mut open = self.settings_open;
+        let mut motor = self.motor.clone();
+        egui::Window::new("Ajustes")
+            .id(egui::Id::unique("ventana-ajustes"))
+            .open(&mut open)
+            .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-18.0, 58.0))
+            .default_width(380.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Motor de búsqueda");
+                    egui::ComboBox::from_id_salt("motor")
+                        .selected_text(match motor.as_str() {
+                            "google" => "Google",
+                            _ => "DuckDuckGo",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut motor, "duckduckgo".into(), "DuckDuckGo");
+                            ui.selectable_value(&mut motor, "google".into(), "Google");
+                        });
+                });
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Descargas").strong());
+                match crate::estado::downloads_dir() {
+                    Some(dir) => {
+                        ui.label(egui::RichText::new(dir.display().to_string()).size(11.0).color(MUTED));
+                        if ui.button("Abrir carpeta de descargas").clicked() {
+                            let _ = webbrowser::open(&dir.to_string_lossy());
+                        }
+                    }
+                    None => {
+                        ui.label("Sin carpeta de descargas configurada.");
+                    }
+                }
+                ui.add_space(6.0);
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(format!("Navegador {}", env!("CARGO_PKG_VERSION")))
+                        .size(11.0)
+                        .color(MUTED),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "Perfil y sesión se guardan en ~/.local/share/navegador y ~/.local/state/navegador.",
+                    )
+                    .size(11.0)
+                    .color(MUTED),
+                );
+            });
+        self.settings_open = open;
+        if motor != self.motor {
+            self.motor = motor;
+            self.save_settings();
+            self.status = format!("motor de búsqueda: {}", self.motor);
+        }
+    }
+
+    fn suggestions(&self) -> Vec<(String, String)> {
+        let needle = self.address.trim().to_lowercase();
+        if needle.is_empty() || needle.starts_with("about:") {
+            return Vec::new();
+        }
+        let current = self.active_url().unwrap_or_default().to_lowercase();
+        if needle == current {
+            return Vec::new();
+        }
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let matches = |url: &str, title: &str| {
+            url.to_lowercase().contains(&needle) || title.to_lowercase().contains(&needle)
+        };
+        for visit in &self.history {
+            if matches(&visit.url, &visit.title) && seen.insert(visit.url.clone()) {
+                out.push((visit.url.clone(), visit.title.clone()));
+            }
+        }
+        for bookmark in &self.bookmarks {
+            if matches(&bookmark.url, &bookmark.title) && seen.insert(bookmark.url.clone()) {
+                out.push((bookmark.url.clone(), bookmark.title.clone()));
+            }
+        }
+        for tab in &self.tabs {
+            if matches(&tab.url, &tab.title) && seen.insert(tab.url.clone()) {
+                out.push((tab.url.clone(), tab.title.clone()));
+            }
+        }
+        out.truncate(6);
+        out
+    }
+
+    fn suggestion_bar(&mut self, ctx: &egui::Context) {
+        let focused = ctx.memory(|memory| memory.has_focus(egui::Id::unique("address")));
+        let Some(rect) = self.suggest_rect else {
+            return;
+        };
+        if !focused {
+            return;
+        }
+        let suggestions = self.suggestions();
+        if suggestions.is_empty() {
+            return;
+        }
+        let mut chosen = None;
+        egui::Area::new(egui::Id::unique("sugerencias"))
+            .fixed_pos(egui::pos2(rect.left(), rect.bottom() + 4.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_width(rect.width().max(320.0));
+                    for (url, title) in &suggestions {
+                        let name = if title.is_empty() { url } else { title };
+                        let label = egui::RichText::new(truncate(name, 60)).size(12.0);
+                        let response = ui.add(egui::Button::new(label).frame(false));
+                        if response.clicked() {
+                            chosen = Some(url.clone());
+                        }
+                        ui.label(
+                            egui::RichText::new(truncate(url, 70))
+                                .size(10.5)
+                                .color(MUTED),
+                        );
+                    }
+                });
+            });
+        if let Some(url) = chosen {
+            self.address = url.clone();
+            self.handle.navigate(url);
+            self.focus_page = true;
+            self.suggest_rect = None;
+        }
+    }
+
     fn find_bar(&mut self, ctx: &egui::Context) {
         if !self.find_open {
             return;
@@ -1312,6 +1472,7 @@ impl ShellApp {
             zoom: self.zoom.clone(),
             permisos: self.permisos.clone(),
             marcadores: self.bookmarks.clone(),
+            motor: self.motor.clone(),
         };
         if let Err(error) = crate::estado::save_settings(&path, &settings) {
             self.status = format!("no se pudieron guardar los ajustes: {error}");
@@ -1506,6 +1667,64 @@ impl ShellApp {
                 }
             }
 
+            let to_css = |pointer: egui::Pos2| {
+                (
+                    ((pointer.x - rect.min.x) / rect.width()) as f64 * css.x as f64,
+                    ((pointer.y - rect.min.y) / rect.height()) as f64 * css.y as f64,
+                )
+            };
+            if response.secondary_clicked()
+                && let Some(pointer) = response.interact_pointer_pos()
+            {
+                self.context_at = Some(to_css(pointer));
+            }
+            if response.middle_clicked()
+                && !self.agent_control
+                && self.pending.is_none()
+                && let Some(pointer) = response.interact_pointer_pos()
+            {
+                let (x, y) = to_css(pointer);
+                self.handle.open_link_new_tab(x, y, true);
+            }
+            let context_at = self.context_at;
+            response.context_menu(|ui| {
+                let Some((x, y)) = context_at else {
+                    return;
+                };
+                if ui.button("Abrir enlace en pestaña nueva").clicked() {
+                    self.handle.open_link_new_tab(x, y, false);
+                    ui.close();
+                }
+                if ui.button("Abrir enlace en segundo plano").clicked() {
+                    self.handle.open_link_new_tab(x, y, true);
+                    ui.close();
+                }
+                if ui.button("Copiar dirección del enlace").clicked() {
+                    self.handle.copy_link(x, y);
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Atrás").clicked() {
+                    self.handle.back();
+                    ui.close();
+                }
+                if ui.button("Adelante").clicked() {
+                    self.handle.forward();
+                    ui.close();
+                }
+                if ui.button("Recargar").clicked() {
+                    self.handle.reload();
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Copiar selección").clicked() {
+                    if let Some(tab) = self.active {
+                        self.handle.copy_text(tab);
+                    }
+                    ui.close();
+                }
+            });
+
             if response.has_focus() {
                 // La página es dueña del teclado: Tab, flechas y Escape no
                 // deben mover el foco dentro de la ventana.
@@ -1622,6 +1841,18 @@ impl eframe::App for ShellApp {
         if ui.input_mut(|input| {
             input.consume_key(
                 egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::T,
+            )
+        }) && let Some(url) = self.closed_tabs.pop()
+        {
+            self.handle.new_tab(Some(url));
+        }
+        if ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
+            self.settings_open = true;
+        }
+        if ui.input_mut(|input| {
+            input.consume_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
                 egui::Key::B,
             )
         }) {
@@ -1648,6 +1879,8 @@ impl eframe::App for ShellApp {
         self.permisos_window(ui.ctx());
         self.bookmarks_window(ui.ctx());
         self.history_window(ui.ctx());
+        self.settings_window(ui.ctx());
+        self.suggestion_bar(ui.ctx());
 
         egui::Panel::top("chrome")
             .frame(
@@ -1862,6 +2095,18 @@ fn short_hash(hash: &str) -> &str {
 
 /// Lo que escribe la persona en la barra: URL si lo parece, búsqueda si no.
 pub fn browser_url(input: &str) -> String {
+    browser_url_with(input, "duckduckgo")
+}
+
+/// URL de búsqueda para el motor elegido en ajustes.
+pub fn search_url(engine: &str, query: &str) -> String {
+    match engine {
+        "google" => format!("https://www.google.com/search?q={}", encode_query(query)),
+        _ => format!("https://duckduckgo.com/?q={}", encode_query(query)),
+    }
+}
+
+pub fn browser_url_with(input: &str, engine: &str) -> String {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return "about:blank".into();
@@ -1878,7 +2123,7 @@ pub fn browser_url(input: &str) -> String {
     if looks_like_url {
         normalize_url(trimmed)
     } else {
-        format!("https://duckduckgo.com/?q={}", encode_query(trimmed))
+        search_url(engine, trimmed)
     }
 }
 
@@ -1942,6 +2187,18 @@ mod tests {
         assert_eq!(normalize_url("localhost:3000"), "http://localhost:3000");
         assert_eq!(normalize_url("http://x.test/a"), "http://x.test/a");
         assert_eq!(normalize_url("  https://x.test  "), "https://x.test");
+    }
+
+    #[test]
+    fn el_motor_de_busqueda_se_puede_elegir() {
+        assert_eq!(
+            super::browser_url_with("gatos", "google"),
+            "https://www.google.com/search?q=gatos"
+        );
+        assert_eq!(
+            super::browser_url_with("gatos", "duckduckgo"),
+            "https://duckduckgo.com/?q=gatos"
+        );
     }
 
     #[test]

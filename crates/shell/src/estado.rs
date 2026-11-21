@@ -117,6 +117,13 @@ pub struct Settings {
     /// Marcadores, del más reciente al más antiguo.
     #[serde(default)]
     pub marcadores: Vec<Bookmark>,
+    /// Motor de búsqueda del omnibox: `duckduckgo` o `google`.
+    #[serde(default = "motor_por_defecto")]
+    pub motor: String,
+}
+
+fn motor_por_defecto() -> String {
+    "duckduckgo".to_string()
 }
 
 /// Permisos que se pueden conceder. Todo en `false` es denegar.

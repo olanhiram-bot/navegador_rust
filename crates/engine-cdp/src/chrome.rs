@@ -66,6 +66,7 @@ impl std::fmt::Debug for Profile {
 pub struct Page {
     id: String,
     ws: String,
+    url: String,
 }
 
 impl Page {
@@ -75,6 +76,10 @@ impl Page {
 
     pub fn ws(&self) -> &str {
         &self.ws
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
     }
 }
 
@@ -92,6 +97,8 @@ pub struct Browser {
     /// los captchas lo identifican como bot.
     _display: Option<VirtualDisplay>,
     port: u16,
+    /// Pestañas que Chromium abre solo al arrancar: no son del usuario.
+    startup_pages: Vec<String>,
 }
 
 impl Browser {
@@ -182,13 +189,25 @@ impl Browser {
         let port =
             wait_for_port(&mut child, &binary, &profile_path, Duration::from_secs(20)).await?;
 
-        Ok(Browser {
+        let mut browser = Browser {
             child,
             profile,
             _lock: lock,
             _display: display,
             port,
-        })
+            startup_pages: Vec::new(),
+        };
+        // Chromium arranca con una pestaña about:blank. No se cierra (cerrar la
+        // última pestaña recrea la ventana y /json/new falla a veces); se marca
+        // para que la sincronización no la confunda con un popup de la web.
+        browser.startup_pages = browser
+            .all_page_targets()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|page| page.id)
+            .collect();
+        Ok(browser)
     }
 
     pub fn port(&self) -> u16 {
@@ -205,7 +224,16 @@ impl Browser {
 
     /// Abre una pestaña nueva dentro de este proceso.
     pub async fn new_page(&self) -> Result<Page> {
-        let body = http_request(self.port, "PUT", "/json/new?url=about:blank").await?;
+        // Con el navegador ocupado /json/new puede devolver una respuesta
+        // vacía; se reintenta antes de darse por vencido.
+        let mut body = String::new();
+        for attempt in 0..3 {
+            body = http_request(self.port, "PUT", "/json/new?url=about:blank").await?;
+            if serde_json::from_str::<Value>(&body).is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100 * (attempt + 1))).await;
+        }
         let target: Value = serde_json::from_str(&body).context("/json/new no es JSON")?;
         let id = target
             .get("id")
@@ -217,11 +245,40 @@ impl Browser {
             .and_then(Value::as_str)
             .context("el target nuevo no trae WebSocket")?
             .to_string();
+        let url = target["url"].as_str().unwrap_or("about:blank").to_string();
         // Con un perfil persistente, Chromium puede restaurar pestañas de la
         // ejecución anterior y dejar la recién creada en segundo plano; una
         // pestaña de fondo no dibuja, así que el screencast se quedaría mudo.
         let _ = self.activate_page(&id).await;
-        Ok(Page { id, ws })
+        Ok(Page { id, ws, url })
+    }
+
+    /// Pestañas `page` que hay ahora mismo en el navegador, incluidas las que
+    /// abrió la propia página con `window.open`.
+    pub async fn page_targets(&self) -> Result<Vec<Page>> {
+        Ok(self
+            .all_page_targets()
+            .await?
+            .into_iter()
+            .filter(|page| !self.startup_pages.contains(&page.id))
+            .collect())
+    }
+
+    async fn all_page_targets(&self) -> Result<Vec<Page>> {
+        let body = http_request(self.port, "GET", "/json/list").await?;
+        let targets: Value = serde_json::from_str(&body).context("/json/list no es JSON")?;
+        let list = targets.as_array().context("/json/list no es un array")?;
+        Ok(list
+            .iter()
+            .filter(|target| target["type"].as_str() == Some("page"))
+            .filter_map(|target| {
+                Some(Page {
+                    id: target["id"].as_str()?.to_string(),
+                    ws: target["webSocketDebuggerUrl"].as_str()?.to_string(),
+                    url: target["url"].as_str().unwrap_or("about:blank").to_string(),
+                })
+            })
+            .collect())
     }
 
     /// Trae al frente la pestaña indicada. Chromium no dibuja una pestaña de
@@ -396,7 +453,14 @@ impl Chrome {
     /// Conecta una pestaña nueva al navegador compartido.
     pub async fn attach(browser: Arc<Browser>) -> Result<Self> {
         let page = browser.new_page().await?;
+        Self::attach_existing(browser, page).await
+    }
+
+    /// Conecta una pestaña que ya existe (por ejemplo, un `window.open`).
+    pub async fn attach_existing(browser: Arc<Browser>, page: Page) -> Result<Self> {
         let cdp = Cdp::connect(page.ws()).await?;
+        // `Inspector.targetCrashed` avisa si el renderer se cae.
+        cdp.call("Inspector.enable", json!({})).await.ok();
         Ok(Chrome {
             browser,
             page,
@@ -591,6 +655,21 @@ impl Chrome {
             }
         }
         Ok(())
+    }
+
+    /// Valor de `target` del enlace (por ejemplo `_blank`).
+    pub async fn link_target(&self, selector: &str) -> Result<Option<String>> {
+        let selector = serde_json::to_string(selector).context("serializar el selector")?;
+        let expression = format!(
+            "(function(s){{const el=document.querySelector(s); if(!el) return null; \
+             const a=el.closest('a[href]'); return JSON.stringify(a ? (a.getAttribute('target') || '') : null);}})({selector})"
+        );
+        let text = self.evaluate_isolated(&expression).await?;
+        let value: Value = serde_json::from_str(&text).context("JSON de target inválido")?;
+        Ok(value
+            .as_str()
+            .filter(|target| !target.is_empty())
+            .map(str::to_string))
     }
 
     /// Selector del botón que enviaría el formulario del campo con el foco.
@@ -1146,6 +1225,13 @@ impl Engine for Chrome {
         denied: &[String],
     ) -> impl std::future::Future<Output = Result<()>> + Send {
         Chrome::set_permissions(self, origin, granted, denied)
+    }
+
+    fn link_target(
+        &self,
+        selector: &str,
+    ) -> impl std::future::Future<Output = Result<Option<String>>> + Send {
+        Chrome::link_target(self, selector)
     }
 }
 

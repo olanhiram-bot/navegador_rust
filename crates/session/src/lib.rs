@@ -293,6 +293,16 @@ impl<E: Engine> Session<E> {
         self.snapshot_now().await
     }
 
+    /// Adopta una página que ya está cargada: pestañas que abrió la propia web
+    /// con `window.open` o enlaces con `target=_blank`.
+    pub async fn adopt(&mut self) -> Result<Snapshot, SessionError> {
+        self.generation = 1;
+        let snapshot = self.snapshot_now().await?;
+        self.url = snapshot.url.clone();
+        self.note_origin(&snapshot.url);
+        Ok(snapshot)
+    }
+
     /// Rehace el snapshot en la generación actual: las refs `@eN` se mantienen.
     pub async fn snapshot(&mut self) -> Result<Snapshot, SessionError> {
         if self.generation == 0 {
@@ -518,6 +528,10 @@ impl<E: Engine + Transport> Session<E> {
 
     pub async fn link_href(&mut self, selector: &str) -> Result<Option<String>, SessionError> {
         Ok(self.engine.link_href(selector).await?)
+    }
+
+    pub async fn link_target(&mut self, selector: &str) -> Result<Option<String>, SessionError> {
+        Ok(self.engine.link_target(selector).await?)
     }
 
     /// Selector del control que un Enter enviaría desde el campo enfocado.

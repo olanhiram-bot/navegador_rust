@@ -74,6 +74,7 @@ impl Cdp {
                                     | "Page.navigatedWithinDocument"
                                     | "Page.domContentEventFired"
                                     | "Browser.downloadWillBegin"
+                                    | "Inspector.targetCrashed"
                                     | "Browser.downloadProgress"
                             )
                         ) {
@@ -104,7 +105,7 @@ impl Cdp {
                 .context("fallo al escribir en CDP")?;
         }
 
-        let response = tokio::time::timeout(Duration::from_secs(15), rx)
+        let response = tokio::time::timeout(Duration::from_secs(30), rx)
             .await
             .with_context(|| format!("timeout esperando respuesta de {method}"))?
             .context("la conexión CDP se cerró")?;

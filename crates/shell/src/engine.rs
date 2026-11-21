@@ -92,6 +92,7 @@ pub enum Event {
 pub enum Command {
     NewTab {
         url: Option<String>,
+        background: bool,
     },
     CloseTab(TabId),
     SelectTab(TabId),
@@ -112,6 +113,15 @@ pub enum Command {
     SelectText(TabId, [f64; 2], [f64; 2]),
     CopyText(TabId),
     Click {
+        x: f64,
+        y: f64,
+    },
+    OpenLinkNewTab {
+        x: f64,
+        y: f64,
+        background: bool,
+    },
+    CopyLink {
         x: f64,
         y: f64,
     },
@@ -149,7 +159,29 @@ pub struct EngineHandle {
 
 impl EngineHandle {
     pub fn new_tab(&self, url: Option<String>) {
-        let _ = self.commands.send(Command::NewTab { url });
+        let _ = self.commands.send(Command::NewTab {
+            url,
+            background: false,
+        });
+    }
+
+    /// Abre una pestaña sin quitarle el foco a la actual.
+    pub fn new_tab_in_background(&self, url: Option<String>) {
+        let _ = self.commands.send(Command::NewTab {
+            url,
+            background: true,
+        });
+    }
+
+    /// Abre en pestaña nueva el enlace que hay en el punto, si lo hay.
+    pub fn open_link_new_tab(&self, x: f64, y: f64, background: bool) {
+        let _ = self
+            .commands
+            .send(Command::OpenLinkNewTab { x, y, background });
+    }
+
+    pub fn copy_link(&self, x: f64, y: f64) {
+        let _ = self.commands.send(Command::CopyLink { x, y });
     }
 
     pub fn close_tab(&self, tab: TabId) {
@@ -379,11 +411,12 @@ fn run(options: Options, mut commands: UnboundedReceiver<Command>, events: Emitt
         };
 
         for url in &options.initial_urls {
-            if let Err(error) = open_tab(&mut state, url, &events).await {
+            if let Err(error) = open_tab(&mut state, url, true, &events).await {
                 events.emit(Event::Error(format!("{error:#}")));
             }
         }
 
+        let mut last_scan = Instant::now();
         loop {
             let input = if let Some(tab) = active_tab(&mut state) {
                 tokio::select! {
@@ -410,11 +443,25 @@ fn run(options: Options, mut commands: UnboundedReceiver<Command>, events: Emitt
                 EngineInput::Browser(None) => {}
             }
 
-            let background_tabs: Vec<_> = state.tabs.keys().copied().filter(|id| Some(*id) != state.active).collect();
+            let background_tabs: Vec<_> = state
+                .tabs
+                .keys()
+                .copied()
+                .filter(|id| Some(*id) != state.active)
+                .collect();
             for id in background_tabs {
                 let tab = state.tabs.get_mut(&id).expect("pestaña existente");
                 if let Some(event) = tab.session.next_event(Duration::ZERO).await? {
                     handle_browser_event(&mut state, id, event, &events, &frames).await;
+                }
+            }
+
+            // Cada medio segundo se sincronizan los targets: aparecen los que
+            // abrió la web (window.open) y desaparecen los que se cerraron.
+            if last_scan.elapsed() >= Duration::from_millis(500) {
+                last_scan = Instant::now();
+                if let Err(error) = sync_targets(&mut state, &events).await {
+                    events.emit(Event::Error(format!("{error:#}")));
                 }
             }
         }
@@ -445,11 +492,115 @@ async fn handle_browser_event(
                 tab.session.ack_screencast_frame(session_id).await.ok();
             }
         }
+        Some("Inspector.targetCrashed") => {
+            let _ = events.emit(Event::Notice(
+                "la pestaña se cayó; recargando la página".into(),
+            ));
+            let url = state
+                .tabs
+                .get(&id)
+                .and_then(|tab| tab.session.url().map(str::to_string));
+            if let Some(url) = url {
+                let tab = state.tabs.get_mut(&id).expect("pestaña existente");
+                if let Ok(snapshot) = tab.session.open(&url).await {
+                    let _ = events.emit(Event::Snapshot {
+                        tab: id,
+                        info: snapshot_info(&snapshot),
+                        elements: snapshot.elements,
+                    });
+                }
+            }
+        }
         Some("Page.domContentEventFired" | "Page.navigatedWithinDocument") => {
             refresh_after_page_navigation(state, id, events).await;
         }
         _ => {}
     }
+}
+
+/// Adopta las pestañas que abrió la propia web y cierra las que ya no existen.
+async fn sync_targets(state: &mut State, events: &Emitter) -> Result<()> {
+    let Some(browser) = state.browser.clone() else {
+        return Ok(());
+    };
+    let Ok(targets) = browser.page_targets().await else {
+        return Ok(());
+    };
+
+    let vanished: Vec<TabId> = state
+        .tabs
+        .iter()
+        .filter(|(_, tab)| !targets.iter().any(|page| page.id() == tab.page_id))
+        .map(|(id, _)| *id)
+        .collect();
+    for id in vanished {
+        close_tab(state, id, events).await?;
+    }
+
+    for page in targets {
+        if state.tabs.values().any(|tab| tab.page_id == page.id()) {
+            continue;
+        }
+        if page.url().starts_with("devtools://") {
+            continue;
+        }
+        if let Err(error) = adopt_tab(state, page, events).await {
+            let _ = events.emit(Event::Error(format!("{error:#}")));
+        }
+    }
+    Ok(())
+}
+
+/// Conecta una pestaña que ya estaba abierta en Chromium (window.open).
+async fn adopt_tab(state: &mut State, page: engine_cdp::Page, events: &Emitter) -> Result<TabId> {
+    let id = state.next_id;
+    state.next_id += 1;
+    let log_path = tab_log_path(&state.log_base, id);
+    let log =
+        ReceiptLog::open(&log_path).with_context(|| format!("abrir el log de la pestaña {id}"))?;
+    let browser = shared_browser(state, events).await?;
+    let chrome = Chrome::attach_existing(browser, page)
+        .await
+        .context("conectar la pestaña que abrió la web")?;
+    let page_id = chrome.page_id().to_string();
+    let mut session = Session::new(
+        chrome,
+        Identity::generate().context("generar la identidad local")?,
+        log,
+        SessionConfig::default(),
+    );
+    let snapshot = session.adopt().await?;
+    session.start_screencast().await?;
+
+    if let Some(previous) = active_tab(state) {
+        previous.session.stop_screencast().await.ok();
+    }
+    state.active = Some(id);
+    state.tabs.insert(
+        id,
+        Tab {
+            capture_scale: 1.0,
+            session,
+            log_path,
+            pending: None,
+            page_id,
+        },
+    );
+    let _ = events.emit(Event::TabOpened(TabInfo {
+        id,
+        url: snapshot.url.clone(),
+        title: snapshot.title.clone(),
+        generation: snapshot.generation,
+        elements: snapshot.elements.len(),
+    }));
+    let _ = events.emit(Event::Selected(Some(id)));
+    let _ = events.emit(Event::Snapshot {
+        tab: id,
+        info: snapshot_info(&snapshot),
+        elements: snapshot.elements,
+    });
+    send_receipts(state, id, events);
+    Ok(id)
 }
 
 /// `true` significa cerrar la shell.
@@ -460,8 +611,14 @@ async fn handle_command(state: &mut State, command: Command, events: &Emitter) -
             state.browser = None;
             return Ok(true);
         }
-        Command::NewTab { url } => {
-            open_tab(state, url.as_deref().unwrap_or("about:blank"), events).await?;
+        Command::NewTab { url, background } => {
+            open_tab(
+                state,
+                url.as_deref().unwrap_or("about:blank"),
+                !background,
+                events,
+            )
+            .await?;
         }
         Command::CloseTab(id) => close_tab(state, id, events).await?,
         Command::SelectTab(id) => select_tab(state, id, events).await?,
@@ -503,6 +660,30 @@ async fn handle_command(state: &mut State, command: Command, events: &Emitter) -
             }
         }
         Command::Click { x, y } => click(state, x, y, events).await?,
+        Command::OpenLinkNewTab { x, y, background } => {
+            open_link_new_tab(state, x, y, background, events).await?;
+        }
+        Command::CopyLink { x, y } => {
+            if let Some(id) = state.active {
+                let href = {
+                    let tab = state.tabs.get_mut(&id).expect("pestaña activa");
+                    let element = tab.session.element_at(x, y).await?;
+                    match element {
+                        Some(element) if element.role == "link" => {
+                            tab.session.link_href(&element.selector).await?
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(href) = href
+                    && (href.starts_with("http://") || href.starts_with("https://"))
+                {
+                    events.emit(Event::CopyText(id, href));
+                } else {
+                    let _ = events.emit(Event::Notice("aquí no hay un enlace que copiar".into()));
+                }
+            }
+        }
         Command::InsertText(text) => {
             if let Some(tab) = active_tab(state) {
                 tab.session.insert_text(&text).await?;
@@ -575,7 +756,7 @@ fn active_tab(state: &mut State) -> Option<&mut Tab> {
     state.active.and_then(|id| state.tabs.get_mut(&id))
 }
 
-async fn open_tab(state: &mut State, url: &str, events: &Emitter) -> Result<TabId> {
+async fn open_tab(state: &mut State, url: &str, select: bool, events: &Emitter) -> Result<TabId> {
     let id = state.next_id;
     state.next_id += 1;
     let log_path = tab_log_path(&state.log_base, id);
@@ -604,10 +785,12 @@ async fn open_tab(state: &mut State, url: &str, events: &Emitter) -> Result<TabI
         elements: snapshot.elements.len(),
     };
     let elements = snapshot.elements.clone();
-    if let Some(previous) = active_tab(state) {
-        previous.session.stop_screencast().await.ok();
+    if select {
+        if let Some(previous) = active_tab(state) {
+            previous.session.stop_screencast().await.ok();
+        }
+        state.active = Some(id);
     }
-    state.active = Some(id);
     state.tabs.insert(
         id,
         Tab {
@@ -620,7 +803,9 @@ async fn open_tab(state: &mut State, url: &str, events: &Emitter) -> Result<TabI
     );
 
     let _ = events.emit(Event::TabOpened(info));
-    let _ = events.emit(Event::Selected(Some(id)));
+    if select {
+        let _ = events.emit(Event::Selected(Some(id)));
+    }
     let _ = events.emit(Event::Snapshot {
         tab: id,
         info: snapshot_info(&snapshot),
@@ -741,7 +926,7 @@ async fn select_tab(state: &mut State, id: TabId, events: &Emitter) -> Result<()
 
 async fn navigate(state: &mut State, url: &str, events: &Emitter) -> Result<()> {
     let Some(id) = state.active else {
-        open_tab(state, url, events).await?;
+        open_tab(state, url, true, events).await?;
         return Ok(());
     };
     let info = {
@@ -922,13 +1107,20 @@ async fn click(state: &mut State, x: f64, y: f64, events: &Emitter) -> Result<()
             }
         }
         "link" => {
-            let href = {
+            let (href, target) = {
                 let tab = state.tabs.get_mut(&id).expect("pestaña activa");
-                tab.session.link_href(&element.selector).await?
+                let href = tab.session.link_href(&element.selector).await?;
+                let target = tab.session.link_target(&element.selector).await?;
+                (href, target)
             };
             return match href {
                 Some(href) if href.starts_with("http://") || href.starts_with("https://") => {
-                    navigate(state, &href, events).await
+                    if target.as_deref() == Some("_blank") {
+                        open_tab(state, &href, true, events).await?;
+                        Ok(())
+                    } else {
+                        navigate(state, &href, events).await
+                    }
                 }
                 _ => {
                     let _ = events.emit(Event::Notice(format!(
@@ -1013,6 +1205,44 @@ async fn submit_with_enter(state: &mut State, events: &Emitter) -> Result<bool> 
     };
     settle_act(state, id, &element.reference, options, outcome, events).await?;
     Ok(true)
+}
+
+/// Abre en pestaña nueva el enlace bajo el punto (clic central o menú
+/// contextual). Sin enlace, no hace nada.
+async fn open_link_new_tab(
+    state: &mut State,
+    x: f64,
+    y: f64,
+    background: bool,
+    events: &Emitter,
+) -> Result<()> {
+    let Some(id) = state.active else {
+        return Ok(());
+    };
+    let href = {
+        let tab = state.tabs.get_mut(&id).expect("pestaña activa");
+        let Some(element) = tab.session.element_at(x, y).await? else {
+            return Ok(());
+        };
+        if element.role != "link" {
+            let _ = events.emit(Event::Notice(
+                "aquí no hay un enlace para abrir aparte".into(),
+            ));
+            return Ok(());
+        }
+        tab.session.link_href(&element.selector).await?
+    };
+    match href {
+        Some(href) if href.starts_with("http://") || href.starts_with("https://") => {
+            open_tab(state, &href, !background, events).await?;
+        }
+        _ => {
+            let _ = events.emit(Event::Notice(
+                "el enlace no tiene un destino navegable".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn approve(state: &mut State, hash: &str, events: &Emitter) -> Result<()> {

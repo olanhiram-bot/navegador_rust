@@ -98,9 +98,8 @@ async fn el_perfil_persistente_conserva_las_cookies_tras_reiniciar() {
     }
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     drop(first);
-    // Cierre ordenado: además del SIGTERM de respaldo, pide a Chromium que
-    // vacíe el almacén de cookies antes de salir.
-    browser.close().await.expect("cierre ordenado");
+    // El cierre por SIGTERM (Browser::drop) es el que vacía el almacén de
+    // cookies; Browser.close sale demasiado rápido y a veces no lo hace.
     drop(browser);
 
     assert!(path.is_dir(), "el perfil persistente no debe borrarse");
