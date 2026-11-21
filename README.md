@@ -88,20 +88,24 @@ del descriptor de forma no interactiva (útil para CI y scripts).
 sitios no lo detectan como navegador automatizado. `NAVEGADOR_HEADLESS=1`
 fuerza headless.
 
-## Shell GPUI (en migración)
+## Shell GPUI (predeterminada)
 
-La interfaz nueva corre sobre [GPUI](https://gpui.rs) (la de Zed), con
-renderizado por GPU:
+La interfaz corre sobre [GPUI](https://gpui.rs) (la de Zed), con renderizado por
+GPU. El instalador y el paquete la instalan como `navegador-shell`:
 
 ```bash
 cargo run -p shell-gpui -- https://ejemplo.com
+packaging/install.sh            # copia navegador-gpui como ~/.local/bin/navegador-shell
 ```
 
-Ya funciona lo esencial: pestañas, barra de direcciones (Ctrl+L), atrás/adelante/
-recargar, clic y rueda sobre la página, teclado (incluido Tab entre campos),
-tarjeta de aprobación y resultado, y pestañas que abre la web. La shell de egui
-sigue siendo la predeterminada hasta que la de GPUI tenga paridad (búsqueda,
-zoom, descargas, permisos, historial, marcadores y ajustes).
+Incluye pestañas, barra de direcciones con sugerencias (Ctrl+L), atrás/adelante/
+recargar, clic/rueda/clic central/menú contextual sobre la página, teclado
+(incluido Tab entre campos), búsqueda en página (Ctrl+F), zoom por sitio
+(Ctrl++ / Ctrl+- / Ctrl+0), historial (Ctrl+H), marcadores (Ctrl+D y
+Ctrl+Shift+B), descargas (Ctrl+J), permisos por sitio y ajustes (Ctrl+,),
+deshacer cierre (Ctrl+Shift+T), panel del agente con handoff (Ctrl+Shift+A),
+tarjeta de aprobación y pestañas que abre la web. La shell anterior de egui sigue en el crate `shell`
+(`cargo run -p shell -- URL`) como referencia.
 
 GPUI arrastra `xattr 0.2.3`, que no compila en Linux con libc reciente; hay una
 copia parcheada en `vendor/xattr` aplicada con `[patch.crates-io]`.

@@ -6000,10 +6000,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "card",
+ "engine-cdp",
  "gpui",
  "image",
  "session",
  "shell",
+ "webbrowser",
 ]
 
 [[package]]

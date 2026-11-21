@@ -15,9 +15,9 @@ for arg in "$@"; do
 done
 here="$(cd "$(dirname "$0")/.." && pwd)"
 
-cargo build --release --locked -p shell
+cargo build --release --locked -p shell-gpui
 
-install -Dm755 "$here/target/release/navegador-shell" "$prefix/bin/navegador-shell"
+install -Dm755 "$here/target/release/navegador-gpui" "$prefix/bin/navegador-shell"
 install -Dm644 "$here/packaging/navegador.desktop" \
   "$prefix/share/applications/navegador.desktop"
 install -Dm644 "$here/packaging/navegador.svg" \

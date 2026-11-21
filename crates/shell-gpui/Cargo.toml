@@ -11,7 +11,9 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 card = { path = "../card" }
+engine-cdp = { path = "../engine-cdp" }
 gpui = "0.2.2"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 shell = { path = "../shell" }
 session = { path = "../session" }
+webbrowser = "1"

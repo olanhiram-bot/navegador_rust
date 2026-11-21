@@ -16,12 +16,12 @@ sha256sums=('SKIP')
 
 build() {
   cd "$srcdir/navegador_rust"
-  cargo build --release --locked -p shell
+  cargo build --release --locked -p shell-gpui
 }
 
 package() {
   cd "$srcdir/navegador_rust"
-  install -Dm755 target/release/navegador-shell "$pkgdir/usr/bin/navegador-shell"
+  install -Dm755 target/release/navegador-gpui "$pkgdir/usr/bin/navegador-shell"
   install -Dm644 packaging/navegador.desktop \
     "$pkgdir/usr/share/applications/navegador.desktop"
   install -Dm644 packaging/navegador.svg \
