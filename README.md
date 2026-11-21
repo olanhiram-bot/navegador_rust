@@ -34,7 +34,10 @@ cargo run -p shell -- https://ejemplo.com --log /tmp/recibos.jsonl
 cargo run -p shell -- --efimero https://ejemplo.com
 
 # atajos: Ctrl+T pestaña, Ctrl+W cerrar, Ctrl+R recargar, Ctrl+Q salir,
-# Ctrl+F buscar en la página, Ctrl++ / Ctrl+- / Ctrl+0 zoom del sitio
+# Ctrl+F buscar en la página, Ctrl++ / Ctrl+- / Ctrl+0 zoom del sitio,
+# Ctrl+D marcador, Ctrl+Shift+B marcadores, Ctrl+H historial
+# descargas: ~/Downloads o $NAVEGADOR_DESCARGAS
+# permisos por sitio y descargas: menú ☰ de la barra
 
 # recomendado para sitios con captcha (Chromium headful en display virtual)
 # Arch: sudo pacman -S xorg-server-xvfb

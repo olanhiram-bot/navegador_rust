@@ -65,8 +65,19 @@ pub struct ShellApp {
     generation: u32,
     selection_origin: Option<egui::Pos2>,
     last_viewport: (Vec2, f32),
+    /// Pide el foco para la página tras navegar: el teclado va a ella sin
+    /// tener que hacer clic primero.
+    focus_page: bool,
     downloads: Vec<DownloadItem>,
     downloads_open: bool,
+    bookmarks: Vec<crate::estado::Bookmark>,
+    bookmarks_open: bool,
+    history: Vec<crate::estado::Visit>,
+    history_open: bool,
+    history_query: String,
+    history_path: Option<PathBuf>,
+    /// Última página anotada, para no duplicar visitas seguidas.
+    last_visit: String,
     /// Barra de búsqueda dentro de la página (Ctrl+F).
     find_open: bool,
     find_text: String,
@@ -89,8 +100,7 @@ pub struct ShellApp {
 impl ShellApp {
     pub fn new(
         options: crate::engine::Options,
-        session_path: Option<PathBuf>,
-        settings_path: Option<PathBuf>,
+        paths: crate::estado::Paths,
         cc: &eframe::CreationContext<'_>,
     ) -> Self {
         let ctx = &cc.egui_ctx;
@@ -106,12 +116,20 @@ impl ShellApp {
         style.spacing.button_padding = egui::vec2(9.0, 4.0);
         ctx.set_style_of(egui::Theme::Dark, style);
 
+        let session_path = paths.session.clone();
+        let settings_path = paths.settings.clone();
         let settings = settings_path
             .as_deref()
             .map(crate::estado::load_settings)
             .unwrap_or_default();
         let zoom = settings.zoom;
         let permisos = settings.permisos;
+        let bookmarks = settings.marcadores;
+        let history = paths
+            .history
+            .as_deref()
+            .map(|path| crate::estado::load_history(path, 500))
+            .unwrap_or_default();
         let first = options
             .initial_urls
             .last()
@@ -138,8 +156,16 @@ impl ShellApp {
             generation: 0,
             selection_origin: None,
             last_viewport: (Vec2::ZERO, 0.0),
+            focus_page: false,
             downloads: Vec::new(),
             downloads_open: false,
+            bookmarks,
+            bookmarks_open: false,
+            history,
+            history_open: false,
+            history_query: String::new(),
+            history_path: paths.history.clone(),
+            last_visit: String::new(),
             find_open: false,
             find_text: String::new(),
             find_total: 0,
@@ -223,6 +249,7 @@ impl ShellApp {
                     self.selection_origin = None;
                     self.last_viewport = (Vec2::ZERO, 0.0);
                     self.active = active;
+                    self.focus_page = active.is_some();
                     self.pending = None;
                     self.result = None;
                     self.elements.clear();
@@ -255,6 +282,22 @@ impl ShellApp {
                     }
                     if Some(tab) == self.active {
                         self.apply_stored_permissions(&info.url);
+                        if info.url != self.last_visit && crate::estado::is_restorable(&info.url) {
+                            self.last_visit = info.url.clone();
+                            let visit = crate::estado::Visit {
+                                url: info.url.clone(),
+                                title: info.title.clone(),
+                                at: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|time| time.as_secs())
+                                    .unwrap_or(0),
+                            };
+                            if let Some(path) = &self.history_path {
+                                let _ = crate::estado::append_history(path, &visit);
+                            }
+                            self.history.insert(0, visit);
+                            self.history.truncate(500);
+                        }
                     }
                     if let Some(known) = self.tabs.iter_mut().find(|known| known.id == tab) {
                         known.url = info.url.clone();
@@ -422,6 +465,7 @@ impl ShellApp {
         self.address = url.clone();
         self.status = format!("navegando a {url}…");
         self.handle.navigate(url);
+        self.focus_page = true;
     }
 
     fn tab_strip(&mut self, ui: &mut egui::Ui) {
@@ -579,42 +623,48 @@ impl ShellApp {
                 .tabs
                 .iter()
                 .find(|tab| Some(tab.id) == self.active)
-                .map(|tab| tab.url.as_str())
+                .map(|tab| tab.url.clone())
                 .filter(|url| url.starts_with("https://") || url.starts_with("http://"));
-            if ui
-                .add_enabled(external_url.is_some(), egui::Button::new("Abrir fuera"))
-                .on_hover_text(
-                    "Abrir esta página en el navegador del sistema (sesión independiente)",
-                )
-                .clicked()
-                && let Some(url) = external_url.map(str::to_owned)
-            {
-                self.open_external(&url);
-            }
-            let origin = self
-                .tabs
-                .iter()
-                .find(|tab| Some(tab.id) == self.active)
-                .and_then(|tab| crate::estado::zoom_key(&tab.url));
-            if ui
-                .add_enabled(origin.is_some(), egui::Button::new("Permisos"))
-                .on_hover_text("Permisos de este sitio")
-                .clicked()
-            {
-                self.permisos_open = !self.permisos_open;
-            }
-            if !self.downloads.is_empty()
-                && ui
-                    .selectable_label(
-                        self.downloads_open,
-                        egui::RichText::new(format!("Descargas ({})", self.downloads.len()))
-                            .size(12.0),
+            ui.menu_button("☰", |ui| {
+                let open = external_url.is_some();
+                if ui
+                    .add_enabled(open, egui::Button::new("Abrir fuera"))
+                    .on_hover_text(
+                        "Abrir esta página en el navegador del sistema (sesión independiente)",
                     )
-                    .on_hover_text("Descargas de esta sesión")
                     .clicked()
-            {
-                self.downloads_open = !self.downloads_open;
-            }
+                    && let Some(url) = external_url.clone()
+                {
+                    self.open_external(&url);
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Marcadores").clicked() {
+                    self.bookmarks_open = true;
+                    ui.close();
+                }
+                if ui.button("Historial").clicked() {
+                    self.history_open = true;
+                    ui.close();
+                }
+                if ui
+                    .button(format!("Descargas ({})", self.downloads.len()))
+                    .clicked()
+                {
+                    self.downloads_open = true;
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        self.active.is_some(),
+                        egui::Button::new("Permisos de este sitio"),
+                    )
+                    .clicked()
+                {
+                    self.permisos_open = true;
+                    ui.close();
+                }
+            });
             if ui
                 .selectable_label(self.agent_open, egui::RichText::new("Agente").size(12.0))
                 .on_hover_text("Panel del agente")
@@ -978,15 +1028,7 @@ impl ShellApp {
             self.permisos.insert(origin.clone(), permisos);
             self.handle
                 .permissions(origin.clone(), permisos.granted(), permisos.denied());
-            if let Some(path) = &self.settings_path {
-                let settings = crate::estado::Settings {
-                    zoom: self.zoom.clone(),
-                    permisos: self.permisos.clone(),
-                };
-                if let Err(error) = crate::estado::save_settings(path, &settings) {
-                    self.status = format!("no se pudieron guardar los permisos: {error}");
-                }
-            }
+            self.save_settings();
         }
     }
 
@@ -1112,14 +1154,164 @@ impl ShellApp {
         // Fuerza un viewport nuevo con el zoom aplicado.
         self.last_viewport = (Vec2::ZERO, 0.0);
         self.status = format!("zoom {}%", (zoom * 100.0).round() as i32);
-        if let Some(path) = &self.settings_path {
-            let settings = crate::estado::Settings {
-                zoom: self.zoom.clone(),
-                permisos: self.permisos.clone(),
-            };
-            if let Err(error) = crate::estado::save_settings(path, &settings) {
-                self.status = format!("no se pudo guardar el zoom: {error}");
+        self.save_settings();
+    }
+
+    fn toggle_bookmark(&mut self, url: String) {
+        if let Some(index) = self
+            .bookmarks
+            .iter()
+            .position(|bookmark| bookmark.url == url)
+        {
+            self.bookmarks.remove(index);
+            self.status = "marcador eliminado".to_string();
+        } else {
+            let title = self
+                .tabs
+                .iter()
+                .find(|tab| tab.url == url)
+                .map(|tab| tab.title.clone())
+                .unwrap_or_default();
+            self.bookmarks
+                .insert(0, crate::estado::Bookmark { url, title });
+            self.status = "marcador guardado (Ctrl+D para quitarlo)".to_string();
+        }
+        self.save_settings();
+    }
+
+    fn bookmarks_window(&mut self, ctx: &egui::Context) {
+        if !self.bookmarks_open {
+            return;
+        }
+        let mut open = self.bookmarks_open;
+        let mut navigate = None;
+        let mut remove = None;
+        egui::Window::new("Marcadores")
+            .id(egui::Id::unique("ventana-marcadores"))
+            .open(&mut open)
+            .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-18.0, 58.0))
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                if self.bookmarks.is_empty() {
+                    ui.label("Sin marcadores. Pulsa Ctrl+D en una página para guardarla.");
+                    return;
+                }
+                for (index, bookmark) in self.bookmarks.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        let name = if bookmark.title.is_empty() {
+                            bookmark.url.as_str()
+                        } else {
+                            bookmark.title.as_str()
+                        };
+                        if ui.link(truncate(name, 48)).clicked() {
+                            navigate = Some(bookmark.url.clone());
+                        }
+                        ui.label(
+                            egui::RichText::new(truncate(&bookmark.url, 40))
+                                .size(10.5)
+                                .color(MUTED),
+                        );
+                        if ui.small_button("Quitar").clicked() {
+                            remove = Some(index);
+                        }
+                    });
+                }
+            });
+        self.bookmarks_open = open;
+        if let Some(index) = remove {
+            self.bookmarks.remove(index);
+            self.save_settings();
+        }
+        if let Some(url) = navigate {
+            self.handle.navigate(url);
+            self.bookmarks_open = false;
+        }
+    }
+
+    fn history_window(&mut self, ctx: &egui::Context) {
+        if !self.history_open {
+            return;
+        }
+        let query = self.history_query.to_lowercase();
+        let rows: Vec<(String, String, String)> = self
+            .history
+            .iter()
+            .filter(|visit| {
+                query.is_empty()
+                    || visit.url.to_lowercase().contains(&query)
+                    || visit.title.to_lowercase().contains(&query)
+            })
+            .take(200)
+            .map(|visit| (visit.url.clone(), visit.title.clone(), visit.at.to_string()))
+            .collect();
+        let mut open = self.history_open;
+        let mut navigate = None;
+        let mut clear = false;
+        egui::Window::new("Historial")
+            .id(egui::Id::unique("ventana-historial"))
+            .open(&mut open)
+            .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-18.0, 58.0))
+            .default_width(480.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.history_query)
+                            .hint_text("Filtrar historial")
+                            .desired_width(260.0),
+                    );
+                    if ui.button("Borrar historial").clicked() {
+                        clear = true;
+                    }
+                });
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .max_height(360.0)
+                    .show(ui, |ui| {
+                        if rows.is_empty() {
+                            ui.label("Nada por aquí.");
+                        }
+                        for (url, title, at) in &rows {
+                            let name = if title.is_empty() { url } else { title };
+                            ui.horizontal(|ui| {
+                                if ui.link(truncate(name, 52)).on_hover_text(url).clicked() {
+                                    navigate = Some(url.clone());
+                                }
+                                ui.label(
+                                    egui::RichText::new(truncate(url, 44))
+                                        .size(10.5)
+                                        .color(MUTED),
+                                );
+                                let _ = at;
+                            });
+                        }
+                    });
+            });
+        self.history_open = open;
+        if clear {
+            if let Some(path) = &self.history_path {
+                let _ = crate::estado::clear_history(path);
             }
+            self.history.clear();
+            self.last_visit.clear();
+            self.status = "historial borrado".to_string();
+        }
+        if let Some(url) = navigate {
+            self.handle.navigate(url);
+            self.history_open = false;
+        }
+    }
+
+    fn save_settings(&mut self) {
+        let Some(path) = self.settings_path.clone() else {
+            return;
+        };
+        let settings = crate::estado::Settings {
+            zoom: self.zoom.clone(),
+            permisos: self.permisos.clone(),
+            marcadores: self.bookmarks.clone(),
+        };
+        if let Err(error) = crate::estado::save_settings(&path, &settings) {
+            self.status = format!("no se pudieron guardar los ajustes: {error}");
         }
     }
 
@@ -1243,6 +1435,12 @@ impl ShellApp {
         let texture = frame.texture.id();
         ui.vertical_centered(|ui| {
             let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
+            // Tras navegar, el teclado va a la página. Si nada tiene el foco,
+            // también: así el teclado nunca se queda sin destinatario.
+            if self.focus_page || ui.ctx().memory(|memory| memory.focused().is_none()) {
+                response.request_focus();
+                self.focus_page = false;
+            }
             ui.painter()
                 .rect_filled(rect.expand(1.0), 0.0, Color32::from_gray(46));
             ui.painter().image(
@@ -1306,6 +1504,28 @@ impl ShellApp {
             }
 
             if response.has_focus() {
+                // La página es dueña del teclado: Tab, flechas y Escape no
+                // deben mover el foco dentro de la ventana.
+                ui.memory_mut(|memory| {
+                    memory.set_focus_lock_filter(
+                        response.id,
+                        egui::EventFilter {
+                            tab: true,
+                            horizontal_arrows: true,
+                            vertical_arrows: true,
+                            escape: true,
+                        },
+                    );
+                });
+                // Tab y Shift+Tab van a la página (campos del formulario) en vez
+                // de mover el foco dentro de la ventana.
+                let next = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
+                let previous =
+                    ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab));
+                if next || previous {
+                    self.handle
+                        .key("Tab", "Tab", 9, if previous { 8 } else { 0 });
+                }
                 self.forward_keyboard(ui);
             }
         });
@@ -1373,6 +1593,22 @@ impl eframe::App for ShellApp {
         if shortcut(egui::Key::R) {
             self.handle.reload();
         }
+        if shortcut(egui::Key::D)
+            && let Some(url) = self.active_url()
+        {
+            self.toggle_bookmark(url);
+        }
+        if shortcut(egui::Key::H) {
+            self.history_open = true;
+        }
+        if ui.input_mut(|input| {
+            input.consume_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::B,
+            )
+        }) {
+            self.bookmarks_open = true;
+        }
         if shortcut(egui::Key::Q) {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -1392,6 +1628,8 @@ impl eframe::App for ShellApp {
         self.find_bar(ui.ctx());
         self.downloads_window(ui.ctx());
         self.permisos_window(ui.ctx());
+        self.bookmarks_window(ui.ctx());
+        self.history_window(ui.ctx());
 
         egui::Panel::top("chrome")
             .frame(
@@ -1486,6 +1724,7 @@ fn texture_options() -> egui::TextureOptions {
 fn special_key(key: egui::Key) -> Option<(&'static str, &'static str, i64)> {
     use egui::Key::*;
     Some(match key {
+        Tab => ("Tab", "Tab", 9),
         Space => (" ", "Space", 32),
         Enter => ("Enter", "Enter", 13),
         Backspace => ("Backspace", "Backspace", 8),

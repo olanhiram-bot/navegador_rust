@@ -75,6 +75,36 @@ pub fn settings_path() -> Option<PathBuf> {
     Some(state_dir()?.join("ajustes.json"))
 }
 
+pub fn history_path() -> Option<PathBuf> {
+    Some(state_dir()?.join("historial.jsonl"))
+}
+
+/// Archivos de estado que usa la shell. Cualquiera puede faltar (perfil
+/// efímero o sin `$HOME`).
+#[derive(Debug, Default, Clone)]
+pub struct Paths {
+    pub session: Option<PathBuf>,
+    pub settings: Option<PathBuf>,
+    pub history: Option<PathBuf>,
+}
+
+/// Una página visitada.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Visit {
+    pub url: String,
+    #[serde(default)]
+    pub title: String,
+    pub at: u64,
+}
+
+/// Un marcador guardado.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Bookmark {
+    pub url: String,
+    #[serde(default)]
+    pub title: String,
+}
+
 /// Preferencias que sobreviven al reinicio.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
@@ -84,6 +114,9 @@ pub struct Settings {
     /// Permisos concedidos o denegados por origen.
     #[serde(default)]
     pub permisos: std::collections::BTreeMap<String, Permisos>,
+    /// Marcadores, del más reciente al más antiguo.
+    #[serde(default)]
+    pub marcadores: Vec<Bookmark>,
 }
 
 /// Permisos que se pueden conceder. Todo en `false` es denegar.
@@ -141,6 +174,40 @@ pub fn save_settings(path: &Path, settings: &Settings) -> std::io::Result<()> {
     let temporary = path.with_extension("json.tmp");
     std::fs::write(&temporary, serde_json::to_vec_pretty(settings)?)?;
     std::fs::rename(&temporary, path)
+}
+
+/// Lee como mucho las últimas `max` visitas del archivo JSONL.
+pub fn load_history(path: &Path, max: usize) -> Vec<Visit> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut visits: Vec<Visit> = text
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .take(max)
+        .collect();
+    visits.truncate(max);
+    visits
+}
+
+pub fn append_history(path: &Path, visit: &Visit) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(file, "{}", serde_json::to_string(visit)?)
+}
+
+pub fn clear_history(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
 }
 
 /// Clave estable del zoom: el origen de la URL, sin ruta ni consulta.
@@ -258,6 +325,28 @@ mod tests {
             }],
             "las páginas en blanco no se restauran"
         );
+    }
+
+    #[test]
+    fn el_historial_guarda_y_recorta() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("historial.jsonl");
+        for index in 0..5 {
+            append_history(
+                &path,
+                &Visit {
+                    url: format!("https://ejemplo.test/{index}"),
+                    title: format!("Página {index}"),
+                    at: index,
+                },
+            )
+            .unwrap();
+        }
+        let visits = load_history(&path, 3);
+        assert_eq!(visits.len(), 3);
+        assert_eq!(visits[0].url, "https://ejemplo.test/4");
+        clear_history(&path).unwrap();
+        assert!(load_history(&path, 10).is_empty());
     }
 
     #[test]

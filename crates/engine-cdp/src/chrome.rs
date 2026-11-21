@@ -779,6 +779,14 @@ impl Chrome {
                 }),
             )
             .await?;
+        // Una pestaña recién abierta puede quedar sin frame hasta que algo la
+        // haga pintar (sobre todo al arrancar). Activarla y forzar una captura
+        // garantiza el primer fotograma del screencast.
+        self.browser.activate_page(self.page.id()).await.ok();
+        self.cdp
+            .call("Page.captureScreenshot", json!({ "format": "jpeg" }))
+            .await
+            .ok();
         Ok(())
     }
 
@@ -809,6 +817,13 @@ impl Chrome {
                 }),
             )
             .await?;
+        // El cambio de tamaño puede no generar un frame de screencast si la
+        // página está quieta; una captura fuerza el pintado y el siguiente
+        // frame llega con las medidas nuevas.
+        self.cdp
+            .call("Page.captureScreenshot", json!({ "format": "jpeg" }))
+            .await
+            .ok();
         Ok(())
     }
 

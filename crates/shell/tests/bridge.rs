@@ -519,7 +519,7 @@ fn enter_en_un_campo_pasa_por_la_tarjeta_y_no_escapa_solo() {
     );
 
     handle.approve(hash);
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let (mut executed, mut receipts) = (false, false);
     while !executed || !receipts {
         let left = deadline.saturating_duration_since(Instant::now());

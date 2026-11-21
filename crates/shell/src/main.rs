@@ -54,6 +54,11 @@ fn main() -> eframe::Result<()> {
     } else {
         None
     };
+    let history_path = if profile.is_some() {
+        shell::estado::history_path()
+    } else {
+        None
+    };
     let initial_urls = match url {
         Some(url) => vec![url],
         None => session_path
@@ -63,6 +68,11 @@ fn main() -> eframe::Result<()> {
             .unwrap_or_else(|| vec!["about:blank".to_string()]),
     };
 
+    let paths = shell::estado::Paths {
+        session: session_path,
+        settings: settings_path,
+        history: history_path,
+    };
     let options = Options {
         initial_urls,
         log_path,
@@ -79,13 +89,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Navegador",
         options_eframe,
-        Box::new(move |cc| {
-            Ok(Box::new(ShellApp::new(
-                options,
-                session_path,
-                settings_path,
-                cc,
-            )))
-        }),
+        Box::new(move |cc| Ok(Box::new(ShellApp::new(options, paths, cc)))),
     )
 }
