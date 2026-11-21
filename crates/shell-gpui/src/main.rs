@@ -87,6 +87,8 @@ struct Shell {
     context: Option<(f32, f32)>,
     show_context: bool,
     menu_open: bool,
+    window_active: Option<bool>,
+    screencast_running: bool,
 }
 
 impl Shell {
@@ -170,6 +172,8 @@ impl Shell {
             context: None,
             show_context: false,
             menu_open: false,
+            window_active: None,
+            screencast_running: true,
         }
     }
 
@@ -895,6 +899,26 @@ impl Render for Shell {
         }
         if let Some(old) = self.previous_frame.take() {
             let _ = cx.drop_image(old, Some(window));
+        }
+
+        // Sin foco no se transmite la página: evita gastar CPU y batería con
+        // una ventana que el usuario no está mirando.
+        let active = window.is_window_active();
+        match (self.window_active, active) {
+            // Solo se pausa tras haber estado activa: al arrancar, un falso
+            // «sin foco» dejaría la página congelada.
+            (Some(true), false) => {
+                self.window_active = Some(false);
+                self.screencast_running = false;
+                self.handle.screencast(false);
+            }
+            (Some(false), true) => {
+                self.window_active = Some(true);
+                self.screencast_running = true;
+                self.handle.screencast(true);
+            }
+            (None, _) => self.window_active = Some(active),
+            _ => {}
         }
 
         let viewport = window.viewport_size();
