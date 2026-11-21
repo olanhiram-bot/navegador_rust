@@ -891,3 +891,166 @@ fn el_clic_central_abre_en_segundo_plano_y_copia_el_enlace() {
     }
     handle.shutdown();
 }
+
+fn aprobar_y_esperar(handle: &EngineHandle, hash: String) {
+    handle.approve(hash);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let (mut executed, mut receipts) = (false, false);
+    while !executed || !receipts {
+        let left = deadline.saturating_duration_since(Instant::now());
+        assert!(!left.is_zero(), "faltó el acto ejecutado o el recibo");
+        match handle
+            .events
+            .recv_timeout(left.min(Duration::from_millis(500)))
+        {
+            Ok(Event::Error(error)) => panic!("error del motor: {error}"),
+            Ok(Event::Act {
+                outcome: ActOutcome::Executed { .. },
+                ..
+            }) => executed = true,
+            Ok(Event::Receipts { count, .. }) if count >= 1 => receipts = true,
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => panic!("el motor cerró el canal"),
+        }
+    }
+}
+
+fn tarjeta_aprobacion(handle: &EngineHandle) -> (String, card::CardView) {
+    match wait_for(handle, 20, |event| {
+        matches!(
+            event,
+            Event::Act {
+                outcome: ActOutcome::ApprovalRequired { .. },
+                ..
+            }
+        )
+    }) {
+        Event::Act {
+            outcome: ActOutcome::ApprovalRequired { hash, card, .. },
+            ..
+        } => (hash, card),
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn tres_recorridos_locales_comparar_rellenar_y_reservar() {
+    let server = navegador::FixtureServer::start();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let handle = spawn(
+        server.page_url("shop.html"),
+        dir.path().join("recibos.jsonl"),
+    );
+
+    // 1) Comparar el importe visible con el que se va a pagar.
+    let (_, elements) = first_snapshot(&handle);
+    let pay = elements
+        .iter()
+        .find(|element| element.name.contains("Pagar"))
+        .expect("botón Pagar");
+    handle.click(pay.x, pay.y);
+    let (hash, card) = tarjeta_aprobacion(&handle);
+    assert!(
+        card.rows.iter().any(|row| row.value.contains("24.90")),
+        "la tarjeta debe coincidir con el total visible: {:?}",
+        card.rows
+    );
+    aprobar_y_esperar(&handle, hash);
+    let order = server
+        .requests()
+        .into_iter()
+        .find(|request| request.path == "/order")
+        .expect("el pedido debe llegar");
+    assert!(
+        order.body.contains("amount=24.90"),
+        "cuerpo: {}",
+        order.body
+    );
+
+    // 2) Rellenar un formulario y guardar.
+    server.clear();
+    handle.navigate(server.page_url("settings.html"));
+    let elements = match wait_for(
+        &handle,
+        20,
+        |event| matches!(event, Event::Snapshot { info, .. } if info.url.ends_with("settings.html")),
+    ) {
+        Event::Snapshot { elements, .. } => elements,
+        _ => unreachable!(),
+    };
+    let field = elements
+        .iter()
+        .find(|element| element.role == "textbox")
+        .expect("campo de nombre");
+    handle.click(field.x, field.y);
+    wait_for(
+        &handle,
+        10,
+        |event| matches!(event, Event::Notice(notice) if notice.contains("enfocado")),
+    );
+    for _ in 0..3 {
+        handle.key("Backspace", "Backspace", 8, 0);
+    }
+    handle.insert_text("Luis");
+    std::thread::sleep(Duration::from_millis(300));
+    let save = elements
+        .iter()
+        .find(|element| element.name.contains("Guardar"))
+        .expect("botón Guardar");
+    handle.click(save.x, save.y);
+    let (hash, card) = tarjeta_aprobacion(&handle);
+    assert!(
+        card.rows.iter().any(|row| row.value.contains("Luis")),
+        "la tarjeta debe mostrar el nombre escrito: {:?}",
+        card.rows
+    );
+    aprobar_y_esperar(&handle, hash);
+    let profile = server
+        .requests()
+        .into_iter()
+        .find(|request| request.path == "/profile")
+        .expect("el perfil debe guardarse");
+    assert!(
+        profile.body.contains("name=Luis"),
+        "cuerpo: {}",
+        profile.body
+    );
+
+    // 3) Preparar una reserva y aprobarla.
+    server.clear();
+    handle.navigate(server.page_url("booking.html"));
+    let elements = match wait_for(
+        &handle,
+        20,
+        |event| matches!(event, Event::Snapshot { info, .. } if info.url.ends_with("booking.html")),
+    ) {
+        Event::Snapshot { elements, .. } => elements,
+        _ => unreachable!(),
+    };
+    let reserve = elements
+        .iter()
+        .find(|element| element.name.contains("Reservar"))
+        .expect("botón Reservar");
+    handle.click(reserve.x, reserve.y);
+    let (hash, card) = tarjeta_aprobacion(&handle);
+    assert!(
+        card.rows
+            .iter()
+            .any(|row| row.value.contains("2026-12-01") || row.value.contains("people")),
+        "la tarjeta debe mostrar la reserva: {:?}",
+        card.rows
+    );
+    aprobar_y_esperar(&handle, hash);
+    let booking = server
+        .requests()
+        .into_iter()
+        .find(|request| request.path == "/booking")
+        .expect("la reserva debe llegar");
+    assert!(
+        booking.body.contains("date=2026-12-01") && booking.body.contains("people=2"),
+        "cuerpo: {}",
+        booking.body
+    );
+    handle.shutdown();
+}

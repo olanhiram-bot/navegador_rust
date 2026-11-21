@@ -21,8 +21,10 @@ Chromium, con perfil persistente y restauración de la sesión. Falta el demo de
 ## Instalación
 
 ```bash
-packaging/install.sh              # binario en ~/.local/bin y entrada de escritorio
+packaging/install.sh                        # binario, entrada de escritorio e icono
 packaging/install.sh /otro/prefijo
+packaging/install.sh --predeterminado       # además registra http/https
+cd packaging && makepkg -si                 # paquete navegador-git (Arch)
 navegador-shell --version
 ```
 
@@ -96,6 +98,8 @@ fuerza headless.
   subida de archivos, alertas) no se ven en la vista por screencast.
 - Sin Widevine no hay DRM; las notificaciones concedidas no llegan al escritorio
   porque Chromium corre en un display virtual.
+- El plan para quitar el cuello de botella del screencast está en
+  [vista-integrada-plan.md](docs/investigacion/vista-integrada-plan.md).
 
 ## Estructura
 

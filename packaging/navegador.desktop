@@ -2,6 +2,7 @@
 Type=Application
 Name=Navegador
 Comment=Navegador auditable: la persona y el agente comparten la misma pestaña
+Icon=navegador
 Exec=navegador-shell %u
 Terminal=false
 Categories=Network;WebBrowser;

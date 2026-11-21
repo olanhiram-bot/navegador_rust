@@ -1,0 +1,29 @@
+# Maintainer: Navegador <olan.hiram@gmail.com>
+pkgname=navegador-git
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Navegador local y auditable: la persona y el agente comparten la misma pestaña"
+arch=('x86_64' 'aarch64')
+url="https://github.com/olanhiram-bot/navegador_rust"
+license=('Apache-2.0')
+depends=('chromium' 'xorg-server-xvfb')
+makedepends=('cargo' 'git')
+provides=('navegador')
+conflicts=('navegador')
+options=('!lto')
+source=("git+$url.git")
+sha256sums=('SKIP')
+
+build() {
+  cd "$srcdir/navegador_rust"
+  cargo build --release --locked -p shell
+}
+
+package() {
+  cd "$srcdir/navegador_rust"
+  install -Dm755 target/release/navegador-shell "$pkgdir/usr/bin/navegador-shell"
+  install -Dm644 packaging/navegador.desktop \
+    "$pkgdir/usr/share/applications/navegador.desktop"
+  install -Dm644 packaging/navegador.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/navegador.svg"
+}
