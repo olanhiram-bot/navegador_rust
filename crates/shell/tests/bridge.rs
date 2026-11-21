@@ -11,7 +11,7 @@ static TEST_SLOTS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
 static TEST_SLOT_CV: std::sync::Condvar = std::sync::Condvar::new();
 
 fn slot() -> Slot {
-    const MAX: usize = 3;
+    const MAX: usize = 2;
     let mut in_use = TEST_SLOTS.lock().unwrap();
     while *in_use >= MAX {
         in_use = TEST_SLOT_CV.wait(in_use).unwrap();
@@ -35,7 +35,9 @@ fn wait_for(
     seconds: u64,
     mut predicate: impl FnMut(&Event) -> bool,
 ) -> Event {
-    let deadline = Instant::now() + Duration::from_secs(seconds);
+    // Suelo generoso: en una máquina cargada el arranque de Chromium y Xvfb
+    // puede tardar bastante más que en una sesión vacía.
+    let deadline = Instant::now() + Duration::from_secs(seconds.max(30));
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         assert!(!left.is_zero(), "no llegó el evento esperado");

@@ -207,6 +207,12 @@ impl Browser {
             .into_iter()
             .map(|page| page.id)
             .collect();
+        if !browser.profile.is_ephemeral() {
+            // El almacén de cookies e historial se carga del disco en paralelo
+            // al arranque. Sin esta pausa, la primera página de un perfil
+            // persistente puede verse sin sesión hasta recargar.
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
         Ok(browser)
     }
 
@@ -405,7 +411,7 @@ impl Drop for Browser {
             unsafe {
                 libc::kill(pid as i32, libc::SIGTERM);
             }
-            self.wait_exit(Duration::from_secs(10));
+            self.wait_exit(Duration::from_secs(20));
             unsafe {
                 libc::kill(-(pid as i32), libc::SIGKILL);
             }
@@ -1369,8 +1375,18 @@ impl VirtualDisplay {
         let _turn = display_turn().lock().await;
         let binary = find_in_path("Xvfb").context("Xvfb no está en PATH")?;
         for n in 99..=110 {
-            if Path::new(&format!("/tmp/.X{n}-lock")).exists() {
-                continue;
+            let lock = format!("/tmp/.X{n}-lock");
+            if Path::new(&lock).exists() {
+                // Un candado de un Xvfb muerto bloquea el display para siempre
+                // y agota el rango tras varias pruebas.
+                let alive = std::fs::read_to_string(&lock)
+                    .ok()
+                    .and_then(|pid| pid.trim().parse::<i32>().ok())
+                    .is_some_and(|pid| unsafe { libc::kill(pid, 0) } == 0);
+                if alive {
+                    continue;
+                }
+                let _ = std::fs::remove_file(&lock);
             }
             let display = format!(":{n}");
             let mut command = Command::new(&binary);

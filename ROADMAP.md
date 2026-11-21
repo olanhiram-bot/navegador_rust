@@ -34,7 +34,7 @@ Se repitió el mismo recorrido con el proyecto en `--release`, un solo proceso C
 | Brave 158.1.100.58 | 340 ms | 45 ms |
 | Firefox 158.0.1 | 908 ms | 62 ms |
 
-En la compilación optimizada, el clic tarda casi la mitad que en la medición inicial con `dev`. El detalle de la vista integrada, incluida la verificación del POST por CDP, está en [la nota de la prueba](docs/investigacion/vista-integrada-qt-2026-11-20.md).
+En la compilación optimizada, el clic tarda casi la mitad que en la medición inicial con `dev`. La shell nueva sobre GPUI ya pinta la interfaz con la GPU, pero los frames de la página siguen llegando por JPEG: el coste de CPU no cambia hasta que se adopte la vista integrada. El detalle de la vista integrada, incluida la verificación del POST por CDP, está en [la nota de la prueba](docs/investigacion/vista-integrada-qt-2026-11-20.md).
 
 ## 2. Uso diario y seguridad
 

@@ -10,6 +10,7 @@ members = [
     "crates/mcp",
     "crates/navegador",
     "crates/shell",
+    "crates/shell-gpui",
 ]
 
 [workspace.package]
@@ -45,3 +46,9 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "net", "sync", "io-util"] }
 tokio-tungstenite = "0.30"
 url = "2"
+
+# GPUI 0.2.2 arrastra xattr 0.2.3, que usa libc::ENOATTR en Linux (donde el
+# atributo se llama ENODATA). Se parchea una copia mínima; quitar cuando GPUI
+# actualice su árbol de dependencias.
+[patch.crates-io]
+xattr = { path = "vendor/xattr" }

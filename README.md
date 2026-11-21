@@ -88,6 +88,24 @@ del descriptor de forma no interactiva (útil para CI y scripts).
 sitios no lo detectan como navegador automatizado. `NAVEGADOR_HEADLESS=1`
 fuerza headless.
 
+## Shell GPUI (en migración)
+
+La interfaz nueva corre sobre [GPUI](https://gpui.rs) (la de Zed), con
+renderizado por GPU:
+
+```bash
+cargo run -p shell-gpui -- https://ejemplo.com
+```
+
+Ya funciona lo esencial: pestañas, barra de direcciones (Ctrl+L), atrás/adelante/
+recargar, clic y rueda sobre la página, teclado (incluido Tab entre campos),
+tarjeta de aprobación y resultado, y pestañas que abre la web. La shell de egui
+sigue siendo la predeterminada hasta que la de GPUI tenga paridad (búsqueda,
+zoom, descargas, permisos, historial, marcadores y ajustes).
+
+GPUI arrastra `xattr 0.2.3`, que no compila en Linux con libc reciente; hay una
+copia parcheada en `vendor/xattr` aplicada con `[patch.crates-io]`.
+
 ## Limitaciones conocidas
 
 - Los botones que solo ejecutan JavaScript, sin formulario ni destino, se

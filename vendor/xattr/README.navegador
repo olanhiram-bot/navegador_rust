@@ -1,0 +1,11 @@
+# xattr 0.2.3 parcheado para Linux
+
+GPUI 0.2.2 → gpui_http_client → zed-async-tar → xattr 0.2.3. Esa versión usa
+`libc::ENOATTR`, que en Linux no existe (el atributo se llama `ENODATA`), así
+que no compila con libc reciente.
+
+El parche está en `src/sys/mod.rs`: en Linux `ENOATTR` se define como
+`libc::ENODATA`; en el resto de plataformas se mantiene `libc::ENOATTR`.
+
+Se aplica con `[patch.crates-io]` en el Cargo.toml del workspace. Quitar cuando
+GPUI actualice su árbol de dependencias.

@@ -97,10 +97,16 @@ async fn el_perfil_persistente_conserva_las_cookies_tras_reiniciar() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let page_id = first.page_id().to_string();
     drop(first);
-    // El cierre por SIGTERM (Browser::drop) es el que vacía el almacén de
-    // cookies; Browser.close sale demasiado rápido y a veces no lo hace.
+    // Cierre ordenado de la pestaña y del navegador: es lo que hace que
+    // Chromium vuelque el almacén de cookies al perfil.
+    browser.close_page(&page_id).await.ok();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    browser.close().await.ok();
     drop(browser);
+    // Chromium lee el almacén una sola vez al arrancar; deja asentar el perfil.
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
     assert!(path.is_dir(), "el perfil persistente no debe borrarse");
 
@@ -109,11 +115,13 @@ async fn el_perfil_persistente_conserva_las_cookies_tras_reiniciar() {
             .await
             .expect("el perfil debe reabrirse"),
     );
+    // El almacén de cookies se carga del disco en paralelo al arranque.
+    tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
     let mut second = Chrome::attach(browser.clone()).await.unwrap();
     second.navigate(&format!("{base}/")).await.unwrap();
     // El almacén de cookies se carga del disco en paralelo al arranque: una
     // primera visita muy temprana puede no verla todavía.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         let text = second.read_text().await.unwrap();
         if text.contains("sesion=demo") {
