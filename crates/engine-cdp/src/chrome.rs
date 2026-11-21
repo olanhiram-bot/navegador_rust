@@ -99,6 +99,9 @@ pub struct Browser {
     port: u16,
     /// Pestañas que Chromium abre solo al arrancar: no son del usuario.
     startup_pages: Vec<String>,
+    /// Modo ventana nativa: Chromium corre en el X11 del escritorio con
+    /// `--app`, para incrustar su ventana en la shell.
+    native: bool,
 }
 
 impl Browser {
@@ -121,7 +124,10 @@ impl Browser {
         // Con Xvfb disponible, Chromium corre headful dentro de un display
         // virtual: los sitios ven un navegador normal. Sin Xvfb se mantiene el
         // modo headless (útil para CI y para quien no quiera instalar X11).
-        let display = if use_virtual_display() {
+        let native_size = native_window_size();
+        let display = if native_size.is_some() {
+            None
+        } else if use_virtual_display() {
             match VirtualDisplay::start().await {
                 Ok(display) => Some(display),
                 Err(error) => {
@@ -151,15 +157,22 @@ impl Browser {
             command.arg("--mute-audio");
         }
 
-        match &display {
-            Some(display) => {
+        match (&display, native_size) {
+            (_, Some((width, height))) => {
+                command
+                    .arg("--ozone-platform=x11")
+                    .arg(format!("--window-size={width},{height}"))
+                    .arg("--window-position=0,0")
+                    .arg("--app=about:blank");
+            }
+            (Some(display), None) => {
                 command
                     .env("DISPLAY", &display.display)
                     .env_remove("WAYLAND_DISPLAY")
                     .arg("--ozone-platform=x11")
                     .arg("--window-position=0,0");
             }
-            None => {
+            (None, None) => {
                 command.arg("--headless=new").arg("--disable-gpu");
             }
         };
@@ -196,6 +209,7 @@ impl Browser {
             _display: display,
             port,
             startup_pages: Vec::new(),
+            native: native_size.is_some(),
         };
         // Chromium arranca con una pestaña about:blank. No se cierra (cerrar la
         // última pestaña recrea la ventana y /json/new falla a veces); se marca
@@ -230,6 +244,17 @@ impl Browser {
 
     /// Abre una pestaña nueva dentro de este proceso.
     pub async fn new_page(&self) -> Result<Page> {
+        // En modo nativo, la primera pestaña es la ventana `--app` que ya
+        // existe: así no se abre una segunda ventana fuera del incrustado.
+        if self.native {
+            let pages = self.all_page_targets().await?;
+            if let Some(page) = pages
+                .into_iter()
+                .find(|page| self.startup_pages.contains(&page.id))
+            {
+                return Ok(page);
+            }
+        }
         // Con el navegador ocupado /json/new puede devolver una respuesta
         // vacía; se reintenta antes de darse por vencido.
         let mut body = String::new();
@@ -1450,6 +1475,13 @@ impl Drop for VirtualDisplay {
         }
         let _ = self.child.start_kill();
     }
+}
+
+/// `NAVEGADOR_NATIVO=1024x768` pide la ventana incrustada.
+fn native_window_size() -> Option<(u32, u32)> {
+    let value = std::env::var("NAVEGADOR_NATIVO").ok()?;
+    let (width, height) = value.split_once('x')?;
+    Some((width.parse().ok()?, height.parse().ok()?))
 }
 
 fn use_virtual_display() -> bool {

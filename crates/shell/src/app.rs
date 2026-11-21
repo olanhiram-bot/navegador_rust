@@ -452,6 +452,7 @@ impl ShellApp {
                         engine_cdp::DownloadState::Progress { .. } => self.status.clone(),
                     };
                 }
+                Event::BrowserPid(_) => {}
                 Event::Notice(notice) => self.status = notice,
                 Event::Error(error) => self.status = format!("error: {error}"),
             }

@@ -80,6 +80,7 @@ pub enum Event {
     },
     CopyText(TabId, String),
     Download(DownloadEvent),
+    BrowserPid(u32),
     Found {
         tab: TabId,
         total: usize,
@@ -844,6 +845,9 @@ async fn shared_browser(state: &mut State, events: &Emitter) -> Result<Arc<Brows
             .context("lanzar Chromium")?,
     };
     let browser = Arc::new(browser);
+    if let Some(pid) = browser.pid() {
+        let _ = events.emit(Event::BrowserPid(pid));
+    }
     if let Some(dir) = state.downloads.clone() {
         let emitter = events.clone();
         browser

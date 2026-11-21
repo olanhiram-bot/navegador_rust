@@ -6006,6 +6006,7 @@ dependencies = [
  "session",
  "shell",
  "webbrowser",
+ "x11rb",
 ]
 
 [[package]]

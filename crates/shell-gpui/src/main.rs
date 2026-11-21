@@ -5,6 +5,9 @@
 //! sitio, búsqueda en página, historial, marcadores, descargas, permisos y
 //! ajustes persistentes.
 
+mod embed;
+
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -87,6 +90,12 @@ struct Shell {
     context: Option<(f32, f32)>,
     show_context: bool,
     menu_open: bool,
+
+    native: bool,
+    browser_pid: Option<u32>,
+    embedded: Option<embed::Embed>,
+    embed_attempt: Option<std::time::Instant>,
+    screencast_stopped: bool,
 }
 
 impl Shell {
@@ -170,6 +179,11 @@ impl Shell {
             context: None,
             show_context: false,
             menu_open: false,
+            native: native_mode(),
+            browser_pid: None,
+            embedded: None,
+            embed_attempt: None,
+            screencast_stopped: false,
         }
     }
 
@@ -305,6 +319,7 @@ impl Shell {
                         DownloadState::Progress { .. } => self.status.clone(),
                     };
                 }
+                Event::BrowserPid(pid) => self.browser_pid = Some(pid),
                 Event::CopyText(_, text) => {
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
                 }
@@ -314,6 +329,7 @@ impl Shell {
                     self.handoff = Some(report);
                     self.agent_open = true;
                 }
+                
                 Event::Receipts { .. } => {}
             }
         }
@@ -902,13 +918,56 @@ impl Render for Shell {
         let page_h = (f32::from(viewport.height) - TAB_BAR - TOOLBAR - STATUS).max(240.0);
         self.page_size = (page_w, page_h);
         let zoom = self.zoom_for(&self.active_url()).max(0.5);
-        let css_w = (page_w / zoom).max(320.0);
-        let css_h = (page_h / zoom).max(240.0);
-        let scale = (window.scale_factor() * zoom).clamp(1.0, 3.0) as f64;
-        let key = (css_w as u32, css_h as u32, scale);
-        if key != self.last_viewport {
-            self.last_viewport = key;
-            self.handle.viewport(key.0, key.1, scale);
+
+        // Vista nativa: la ventana de Chromium se incrusta bajo la barra.
+        if self.native {
+            let overlays = self.panel != Panel::None
+                || self.menu_open
+                || self.show_context
+                || self.field == Field::Find
+                || self.pending.is_some()
+                || self.result.is_some();
+            let bounds = (
+                0i16,
+                (TAB_BAR + TOOLBAR) as i16,
+                page_w as u16,
+                page_h as u16,
+            );
+            if let Some(embed) = &mut self.embedded {
+                embed.place(bounds.0, bounds.1, bounds.2, bounds.3);
+                embed.set_visible(!overlays);
+                if !self.screencast_stopped {
+                    self.screencast_stopped = true;
+                    self.handle.screencast(false);
+                }
+            } else {
+                let due = self
+                    .embed_attempt
+                    .is_none_or(|at| at.elapsed() > Duration::from_millis(700));
+                if due && self.browser_pid.is_some() {
+                    self.embed_attempt = Some(std::time::Instant::now());
+                    match embed::Embed::attach(self.browser_pid.unwrap()) {
+                        Ok(mut embed) => {
+                            embed.place(bounds.0, bounds.1, bounds.2, bounds.3);
+                            self.embedded = Some(embed);
+                        }
+                        Err(error) => {
+                            self.status = format!("vista nativa: {error:#}");
+                        }
+                    }
+                }
+            }
+        }
+
+        if !self.native {
+            let css_w = (page_w / zoom).max(320.0);
+            let css_h = (page_h / zoom).max(240.0);
+            let scale = (window.scale_factor() * zoom).clamp(1.0, 3.0) as f64;
+            let key = (css_w as u32, css_h as u32, scale);
+            if key != self.last_viewport {
+                self.last_viewport = key;
+                self.handle.viewport(key.0, key.1, scale);
+            }
         }
 
         let tabs = self.tabs.clone();
@@ -1065,7 +1124,9 @@ impl Render for Shell {
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::page_middle))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::page_right))
             .on_scroll_wheel(cx.listener(Self::page_wheel));
-        if let Some(frame) = self.frame.clone() {
+        if self.native {
+            // El contenido lo pinta la ventana incrustada.
+        } else if let Some(frame) = self.frame.clone() {
             page = page.child(img(frame).object_fit(ObjectFit::Fill).w_full().h_full());
         } else if loading {
             page = page.child(
@@ -1782,14 +1843,30 @@ impl Render for Shell {
     }
 }
 
+fn native_mode() -> bool {
+    std::env::var_os("NAVEGADOR_NATIVO").is_some()
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "--nativo") {
+        // Debe fijarse antes de crear el motor, que lee la variable.
+        unsafe { std::env::set_var("NAVEGADOR_NATIVO", "1200x800") };
+    }
     if args.iter().any(|arg| arg == "--version" || arg == "-V") {
         println!("navegador-gpui {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    if args.iter().any(|arg| arg == "--nativo") {
+        // Chromium corre en el X11 del escritorio con una ventana `--app`;
+        // la shell la incrusta (requiere X11/XWayland).
+        unsafe {
+            std::env::set_var("NAVEGADOR_NATIVO", "1024x768");
+        }
+    }
     let cli_url = args
         .into_iter()
+        .filter(|arg| arg != "--nativo")
         .find(|arg| !arg.starts_with("--"))
         .map(|url| shell::app::browser_url(&url));
 
