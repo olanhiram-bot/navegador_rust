@@ -203,6 +203,14 @@ pub trait Transport {
 }
 
 /// El motor mínimo que la sesión necesita.
+/// Resultado de buscar texto en la página.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FindResult {
+    pub total: usize,
+    /// Índice de la coincidencia resaltada; `-1` si no hay ninguna.
+    pub current: i64,
+}
+
 pub trait Engine {
     fn navigate(&mut self, url: &str) -> impl Future<Output = anyhow::Result<()>> + Send;
 
@@ -232,5 +240,19 @@ pub trait Engine {
     /// Selector del control que un Enter enviaría desde el campo con el foco.
     fn form_submitter(&self) -> impl Future<Output = anyhow::Result<Option<String>>> + Send {
         async { Ok(None) }
+    }
+
+    /// Busca texto en la página y resalta las coincidencias.
+    fn find(
+        &self,
+        _text: &str,
+        _index: i64,
+    ) -> impl Future<Output = anyhow::Result<FindResult>> + Send {
+        async {
+            Ok(FindResult {
+                total: 0,
+                current: -1,
+            })
+        }
     }
 }

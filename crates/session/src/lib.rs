@@ -525,6 +525,11 @@ impl<E: Engine + Transport> Session<E> {
         Ok(self.engine.form_submitter().await?)
     }
 
+    /// Busca texto en la página; `index` elige la coincidencia resaltada.
+    pub async fn find(&self, text: &str, index: i64) -> Result<engine::FindResult, SessionError> {
+        Ok(self.engine.find(text, index).await?)
+    }
+
     pub async fn youtube_search_query(
         &self,
         selector: &str,

@@ -543,3 +543,65 @@ fn enter_en_un_campo_pasa_por_la_tarjeta_y_no_escapa_solo() {
     assert!(sent[0].contains("q=hola"), "envío inesperado: {sent:?}");
     handle.shutdown();
 }
+
+#[test]
+fn un_perfil_ocupado_sigue_navegando_con_un_perfil_temporal() {
+    let server = navegador::FixtureServer::start();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let profile = dir.path().join("perfil");
+    let open = |url: String| {
+        shell::engine::spawn_with_options(
+            shell::engine::Options {
+                initial_urls: vec![url],
+                log_path: dir.path().join("recibos.jsonl"),
+                profile: Some(profile.clone()),
+            },
+            std::sync::Arc::new(|| {}),
+        )
+    };
+
+    let first = open(server.page_url("shop.html"));
+    first_snapshot(&first);
+
+    // El perfil está tomado por la primera ventana: la segunda debe avisar y
+    // seguir funcionando con un perfil temporal, no quedarse vacía.
+    let second = open(server.page_url("settings.html"));
+    wait_for(
+        &second,
+        30,
+        |event| matches!(event, Event::Notice(notice) if notice.contains("perfil temporal")),
+    );
+    first_snapshot(&second);
+    second.shutdown();
+    first.shutdown();
+}
+
+#[test]
+fn buscar_en_la_pagina_cuenta_y_recorre_las_coincidencias() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let url = "data:text/html,<body><p>hola mundo</p><p>hola otra vez</p><p>adios</p></body>";
+    let handle = spawn(url.to_string(), dir.path().join("log"));
+    wait_for(&handle, 20, |event| matches!(event, Event::Snapshot { .. }));
+
+    let found = |total, current| {
+        move |event: &Event| {
+            matches!(
+                event,
+                Event::Found { total: t, current: c, .. } if *t == total && *c == current
+            )
+        }
+    };
+
+    handle.find("hola", 0);
+    wait_for(&handle, 10, found(2, 0));
+    handle.find("hola", 1);
+    wait_for(&handle, 10, found(2, 1));
+    // Avanzar desde la última vuelve a la primera.
+    handle.find("hola", 2);
+    wait_for(&handle, 10, found(2, 0));
+    handle.find("no existe", 0);
+    wait_for(&handle, 10, found(0, -1));
+    handle.find("", 0);
+    wait_for(&handle, 10, found(0, -1));
+    handle.shutdown();
+}

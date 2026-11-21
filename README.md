@@ -33,6 +33,9 @@ cargo run -p shell -- https://ejemplo.com --log /tmp/recibos.jsonl
 # directorio; --sin-restaurar abre una pestaña en lugar de las de la última vez.
 cargo run -p shell -- --efimero https://ejemplo.com
 
+# atajos: Ctrl+T pestaña, Ctrl+W cerrar, Ctrl+R recargar, Ctrl+Q salir,
+# Ctrl+F buscar en la página, Ctrl++ / Ctrl+- / Ctrl+0 zoom del sitio
+
 # recomendado para sitios con captcha (Chromium headful en display virtual)
 # Arch: sudo pacman -S xorg-server-xvfb
 # NAVEGADOR_HEADLESS=1 fuerza el modo headless (CI)

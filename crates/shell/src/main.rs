@@ -49,6 +49,11 @@ fn main() -> eframe::Result<()> {
     } else {
         None
     };
+    let settings_path = if profile.is_some() {
+        shell::estado::settings_path()
+    } else {
+        None
+    };
     let initial_urls = match url {
         Some(url) => vec![url],
         None => session_path
@@ -73,6 +78,13 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Navegador",
         options_eframe,
-        Box::new(move |cc| Ok(Box::new(ShellApp::new(options, session_path, cc)))),
+        Box::new(move |cc| {
+            Ok(Box::new(ShellApp::new(
+                options,
+                session_path,
+                settings_path,
+                cc,
+            )))
+        }),
     )
 }

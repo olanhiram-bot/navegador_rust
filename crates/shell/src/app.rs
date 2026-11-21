@@ -56,6 +56,17 @@ pub struct ShellApp {
     generation: u32,
     selection_origin: Option<egui::Pos2>,
     last_viewport: (Vec2, f32),
+    /// Barra de búsqueda dentro de la página (Ctrl+F).
+    find_open: bool,
+    find_text: String,
+    find_total: usize,
+    find_current: i64,
+    find_focus: bool,
+    /// Último texto enviado al motor, para no repetir la búsqueda cada frame.
+    find_query: String,
+    /// Zoom por origen, persistido en `ajustes.json`.
+    zoom: std::collections::BTreeMap<String, f32>,
+    settings_path: Option<PathBuf>,
     /// Dónde se guarda la sesión; `None` con perfil efímero.
     session_path: Option<PathBuf>,
     saved_session: Option<crate::estado::SessionState>,
@@ -65,6 +76,7 @@ impl ShellApp {
     pub fn new(
         options: crate::engine::Options,
         session_path: Option<PathBuf>,
+        settings_path: Option<PathBuf>,
         cc: &eframe::CreationContext<'_>,
     ) -> Self {
         let ctx = &cc.egui_ctx;
@@ -80,6 +92,11 @@ impl ShellApp {
         style.spacing.button_padding = egui::vec2(9.0, 4.0);
         ctx.set_style_of(egui::Theme::Dark, style);
 
+        let zoom = settings_path
+            .as_deref()
+            .map(crate::estado::load_settings)
+            .map(|settings| settings.zoom)
+            .unwrap_or_default();
         let first = options
             .initial_urls
             .last()
@@ -106,6 +123,14 @@ impl ShellApp {
             generation: 0,
             selection_origin: None,
             last_viewport: (Vec2::ZERO, 0.0),
+            find_open: false,
+            find_text: String::new(),
+            find_total: 0,
+            find_current: -1,
+            find_focus: false,
+            find_query: String::new(),
+            zoom,
+            settings_path,
             session_path,
             saved_session: None,
         }
@@ -182,6 +207,7 @@ impl ShellApp {
                     self.pending = None;
                     self.result = None;
                     self.elements.clear();
+                    self.reset_find();
                     match active.and_then(|id| self.tabs.iter().find(|tab| tab.id == id)) {
                         Some(tab) => {
                             self.address = tab.url.clone();
@@ -205,6 +231,9 @@ impl ShellApp {
                     info,
                     elements,
                 } => {
+                    if Some(tab) == self.active && self.find_open {
+                        self.reset_find();
+                    }
                     if let Some(known) = self.tabs.iter_mut().find(|known| known.id == tab) {
                         known.url = info.url.clone();
                         known.title = info.title.clone();
@@ -280,6 +309,21 @@ impl ShellApp {
                 Event::CopyText(tab, text) => {
                     if Some(tab) == self.active {
                         ctx.copy_text(text);
+                    }
+                }
+                Event::Found {
+                    tab,
+                    total,
+                    current,
+                } => {
+                    if Some(tab) == self.active {
+                        self.find_total = total;
+                        self.find_current = current;
+                        self.status = if total == 0 {
+                            format!("sin coincidencias para «{}»", self.find_text)
+                        } else {
+                            format!("coincidencia {} de {total}", current + 1)
+                        };
                     }
                 }
                 Event::Notice(notice) => self.status = notice,
@@ -762,6 +806,151 @@ impl ShellApp {
             });
     }
 
+    /// Buscador flotante. No altera el contenido: resalta por CSS y lleva la
+    /// coincidencia actual a la vista.
+    fn find_bar(&mut self, ctx: &egui::Context) {
+        if !self.find_open {
+            return;
+        }
+        let mut close = false;
+        egui::Window::new("buscar")
+            .id(egui::Id::unique("barra-buscar"))
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-18.0, 58.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.find_text)
+                            .id(egui::Id::unique("buscar-texto"))
+                            .hint_text("Buscar en la página")
+                            .desired_width(200.0),
+                    );
+                    if self.find_focus {
+                        response.request_focus();
+                        self.find_focus = false;
+                    }
+                    if self.find_text != self.find_query {
+                        self.find_query = self.find_text.clone();
+                        self.find_total = 0;
+                        self.find_current = -1;
+                        let text = self.find_text.clone();
+                        self.handle.find(text, 0);
+                    }
+                    let counter = if self.find_text.is_empty() {
+                        String::new()
+                    } else if self.find_total == 0 {
+                        "0".to_string()
+                    } else {
+                        format!("{} de {}", self.find_current + 1, self.find_total)
+                    };
+                    ui.label(egui::RichText::new(counter).color(MUTED).size(12.0));
+                    if ui.button("Anterior").clicked() {
+                        self.step_find(false);
+                    }
+                    if ui.button("Siguiente").clicked() {
+                        self.step_find(true);
+                    }
+                    if ui.button("×").on_hover_text("Cerrar (Esc)").clicked() {
+                        close = true;
+                    }
+                });
+            });
+
+        let enter =
+            ctx.input(|input| input.key_pressed(egui::Key::Enter) && !input.modifiers.shift);
+        let enter_back =
+            ctx.input(|input| input.key_pressed(egui::Key::Enter) && input.modifiers.shift);
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            close = true;
+        }
+        if enter {
+            self.step_find(true);
+        } else if enter_back {
+            self.step_find(false);
+        }
+        if close {
+            self.close_find();
+        }
+    }
+
+    fn step_find(&mut self, forward: bool) {
+        if self.find_text.is_empty() {
+            return;
+        }
+        let index = if self.find_total == 0 || self.find_current < 0 {
+            0
+        } else if forward {
+            self.find_current + 1
+        } else {
+            self.find_current - 1
+        };
+        self.handle.find(self.find_text.clone(), index);
+    }
+
+    fn zoom_for(&self, url: &str) -> f32 {
+        crate::estado::zoom_key(url)
+            .and_then(|origin| self.zoom.get(&origin).copied())
+            .unwrap_or(1.0)
+    }
+
+    fn adjust_zoom(&mut self, delta: f32) {
+        let Some(url) = self.active_url() else {
+            return;
+        };
+        let current = self.zoom_for(&url);
+        self.apply_zoom(&url, current + delta);
+    }
+
+    fn set_zoom(&mut self, value: f32) {
+        let Some(url) = self.active_url() else {
+            return;
+        };
+        self.apply_zoom(&url, value);
+    }
+
+    fn apply_zoom(&mut self, url: &str, value: f32) {
+        let Some(origin) = crate::estado::zoom_key(url) else {
+            self.status = "esta página no admite zoom".to_string();
+            return;
+        };
+        let zoom = (value * 10.0).round().clamp(5.0, 30.0) / 10.0;
+        self.zoom.insert(origin, zoom);
+        // Fuerza un viewport nuevo con el zoom aplicado.
+        self.last_viewport = (Vec2::ZERO, 0.0);
+        self.status = format!("zoom {}%", (zoom * 100.0).round() as i32);
+        if let Some(path) = &self.settings_path {
+            let settings = crate::estado::Settings {
+                zoom: self.zoom.clone(),
+            };
+            if let Err(error) = crate::estado::save_settings(path, &settings) {
+                self.status = format!("no se pudo guardar el zoom: {error}");
+            }
+        }
+    }
+
+    fn active_url(&self) -> Option<String> {
+        let id = self.active?;
+        self.tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .map(|tab| tab.url.clone())
+    }
+
+    fn reset_find(&mut self) {
+        self.find_open = false;
+        self.find_total = 0;
+        self.find_current = -1;
+        self.find_query.clear();
+    }
+
+    fn close_find(&mut self) {
+        self.reset_find();
+        self.handle.find(String::new(), 0);
+        self.status = "listo".to_string();
+    }
+
     fn page(&mut self, ui: &mut egui::Ui) {
         let Some(tab) = self.active else {
             ui.centered_and_justified(|ui| {
@@ -774,8 +963,8 @@ impl ShellApp {
             .tabs
             .iter()
             .find(|info| info.id == tab)
-            .map(|info| info.url.as_str())
-            .unwrap_or("");
+            .map(|info| info.url.clone())
+            .unwrap_or_default();
         if current_url == "about:blank" {
             ui.add_space(ui.available_height() * 0.22);
             ui.vertical_centered(|ui| {
@@ -788,7 +977,7 @@ impl ShellApp {
             });
             return;
         }
-        if let Some(query) = google_verification(current_url) {
+        if let Some(query) = google_verification(&current_url) {
             ui.add_space(8.0);
             ui.group(|ui| {
                 ui.strong("Google solicita una verificación");
@@ -817,21 +1006,27 @@ impl ShellApp {
 
         let available = ui.available_size();
         let target = egui::vec2(available.x.max(320.0), available.y.max(240.0));
+        // El zoom reduce los píxeles CSS visibles y sube la densidad: la página
+        // se ve más grande sin perder nitidez.
+        let zoom = self.zoom_for(&current_url).max(0.5);
+        let css_target = egui::vec2((target.x / zoom).max(320.0), (target.y / zoom).max(240.0));
         // Nitidez sin reventar memoria: si el viewport a escala 2 supera el
         // presupuesto de píxeles, bajamos el deviceScaleFactor. Cada frame
         // RGBA cuesta width*height*4 y se nota en la fluidez.
-        let mut scale = ui.ctx().pixels_per_point().clamp(1.0, 3.0);
+        let mut scale = ui.ctx().pixels_per_point().clamp(1.0, 3.0) * zoom;
         const BUDGET: f32 = 8_300_000.0;
-        if target.x * target.y * scale * scale > BUDGET {
-            scale = (BUDGET / (target.x * target.y)).sqrt().clamp(1.0, scale);
+        if css_target.x * css_target.y * scale * scale > BUDGET {
+            scale = (BUDGET / (css_target.x * css_target.y))
+                .sqrt()
+                .clamp(1.0, scale);
         }
-        if (target - self.last_viewport.0).length() > 2.0
+        if (css_target - self.last_viewport.0).length() > 2.0
             || (scale - self.last_viewport.1).abs() > 0.01
         {
-            self.last_viewport = (target, scale);
+            self.last_viewport = (css_target, scale);
             self.handle.viewport(
-                target.x.round() as u32,
-                target.y.round() as u32,
+                css_target.x.round() as u32,
+                css_target.y.round() as u32,
                 scale as f64,
             );
         }
@@ -988,6 +1183,20 @@ impl eframe::App for ShellApp {
         if shortcut(egui::Key::Q) {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
+        if shortcut(egui::Key::F) {
+            self.find_open = true;
+            self.find_focus = true;
+        }
+        if shortcut(egui::Key::Plus) || shortcut(egui::Key::Equals) {
+            self.adjust_zoom(0.1);
+        }
+        if shortcut(egui::Key::Minus) {
+            self.adjust_zoom(-0.1);
+        }
+        if shortcut(egui::Key::Num0) {
+            self.set_zoom(1.0);
+        }
+        self.find_bar(ui.ctx());
 
         egui::Panel::top("chrome")
             .frame(

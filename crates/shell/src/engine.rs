@@ -79,6 +79,11 @@ pub enum Event {
         log: PathBuf,
     },
     CopyText(TabId, String),
+    Found {
+        tab: TabId,
+        total: usize,
+        current: i64,
+    },
     Notice(String),
     Error(String),
 }
@@ -121,6 +126,10 @@ pub enum Command {
     },
     Deny,
     Handoff,
+    Find {
+        text: String,
+        index: i64,
+    },
     Shutdown,
 }
 
@@ -207,6 +216,15 @@ impl EngineHandle {
 
     pub fn handoff(&self) {
         let _ = self.commands.send(Command::Handoff);
+    }
+
+    /// Busca en la página activa. `index` se toma módulo el total, así que
+    /// avanzar y retroceder es sumar o restar uno.
+    pub fn find(&self, text: impl Into<String>, index: i64) {
+        let _ = self.commands.send(Command::Find {
+            text: text.into(),
+            index,
+        });
     }
 
     /// Espera a que el motor cierre Chromium. Acotado para no colgar la salida.
@@ -472,6 +490,17 @@ async fn handle_command(state: &mut State, command: Command, events: &Emitter) -
                 tab.session.key(&key, &code, virtual_key, modifiers).await?;
             }
         }
+        Command::Find { text, index } => {
+            if let Some(tab) = active_tab(state) {
+                let found = tab.session.find(&text, index).await?;
+                let id = state.active.expect("hay pestaña activa");
+                let _ = events.emit(Event::Found {
+                    tab: id,
+                    total: found.total,
+                    current: found.current,
+                });
+            }
+        }
         Command::Approve { hash } => approve(state, &hash, events).await?,
         Command::Deny => deny(state, events),
         Command::Handoff => handoff(state, events).await,
@@ -489,7 +518,7 @@ async fn open_tab(state: &mut State, url: &str, events: &Emitter) -> Result<TabI
     let log_path = tab_log_path(&state.log_base, id);
     let log =
         ReceiptLog::open(&log_path).with_context(|| format!("abrir el log de la pestaña {id}"))?;
-    let browser = shared_browser(state).await?;
+    let browser = shared_browser(state, events).await?;
     let chrome = Chrome::attach_for_shell(browser)
         .await
         .context("abrir una pestaña en Chromium")?;
@@ -539,19 +568,34 @@ async fn open_tab(state: &mut State, url: &str, events: &Emitter) -> Result<TabI
 }
 
 /// Un solo Chromium por sesión: así las pestañas comparten cookies y perfil.
-async fn shared_browser(state: &mut State) -> Result<Arc<Browser>> {
+///
+/// Si otra ventana u otro Chromium tiene tomado el perfil, se arranca con un
+/// perfil temporal y se avisa: es mejor navegar sin las sesiones guardadas que
+/// quedarse con la ventana vacía.
+async fn shared_browser(state: &mut State, events: &Emitter) -> Result<Arc<Browser>> {
     if let Some(browser) = &state.browser {
         return Ok(browser.clone());
     }
-    let profile = match &state.profile {
-        Some(path) => Profile::persistent(path.clone()),
-        None => Profile::ephemeral()?,
-    };
-    let browser = Arc::new(
-        Browser::launch(profile, true)
+    let browser = match state.profile.clone() {
+        Some(path) => match Browser::launch(Profile::persistent(path.clone()), true).await {
+            Ok(browser) => browser,
+            Err(error) if format!("{error:#}").contains("está en uso") => {
+                let _ = events.emit(Event::Notice(format!(
+                    "el perfil {} está ocupado por otro Chromium: abro con un perfil temporal y sin tus inicios de sesión",
+                    path.display()
+                )));
+                state.profile = None;
+                Browser::launch(Profile::ephemeral()?, true)
+                    .await
+                    .context("lanzar Chromium con un perfil temporal")?
+            }
+            Err(error) => return Err(error).context("lanzar Chromium"),
+        },
+        None => Browser::launch(Profile::ephemeral()?, true)
             .await
             .context("lanzar Chromium")?,
-    );
+    };
+    let browser = Arc::new(browser);
     state.browser = Some(browser.clone());
     Ok(browser)
 }

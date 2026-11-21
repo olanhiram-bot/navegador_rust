@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use descriptor::{ActionDescriptor, Provenance, RawAction};
-use engine::{DispatchOutcome, ElementRef, Engine, Snapshot};
+use engine::{DispatchOutcome, ElementRef, Engine, FindResult, Snapshot};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -20,6 +20,7 @@ const SNAPSHOT_JS: &str = include_str!("snapshot.js");
 const ELEMENT_NAME_JS: &str = include_str!("element-name.js");
 const HIT_JS: &str = include_str!("hit.js");
 const SUBMITTER_JS: &str = include_str!("submitter.js");
+const FIND_JS: &str = include_str!("find.js");
 
 /// Perfil de Chromium: efímero (directorio temporal que se borra al cerrar) o
 /// persistente (conserva cookies e inicios de sesión entre arranques).
@@ -444,6 +445,21 @@ impl Chrome {
             .get("selector")
             .and_then(Value::as_str)
             .map(str::to_string))
+    }
+
+    /// Resalta todas las apariciones de `text` y lleva la indicada a la vista.
+    /// `index` se toma módulo el total, así que sirve para avanzar y retroceder.
+    pub async fn find(&self, text: &str, index: i64) -> Result<FindResult> {
+        let expression = format!(
+            "({FIND_JS})({}, {index})",
+            serde_json::to_string(text).context("serializar la búsqueda")?
+        );
+        let value: Value = serde_json::from_str(&self.evaluate_isolated(&expression).await?)
+            .context("JSON de búsqueda inválido")?;
+        Ok(FindResult {
+            total: value["total"].as_u64().unwrap_or(0) as usize,
+            current: value["current"].as_i64().unwrap_or(-1),
+        })
     }
 
     /// Selector del botón que enviaría el formulario del campo con el foco.
@@ -966,6 +982,14 @@ impl Engine for Chrome {
     fn form_submitter(&self) -> impl std::future::Future<Output = Result<Option<String>>> + Send {
         Chrome::form_submitter(self)
     }
+
+    fn find(
+        &self,
+        text: &str,
+        index: i64,
+    ) -> impl std::future::Future<Output = Result<FindResult>> + Send {
+        Chrome::find(self, text, index)
+    }
 }
 
 impl engine::Transport for Chrome {
@@ -1217,6 +1241,13 @@ async fn wait_for_port(
             .try_wait()
             .with_context(|| format!("no se pudo consultar el estado de {}", binary.display()))?
         {
+            // Chromium sale con 21 cuando otro proceso ya tiene el perfil.
+            if status.code() == Some(21) {
+                bail!(
+                    "el perfil {} está en uso por otro Chromium",
+                    profile.display()
+                );
+            }
             bail!(
                 "{} terminó antes de publicar DevToolsActivePort ({status})",
                 binary.display()
@@ -1252,7 +1283,7 @@ fn lock_profile(profile: &Path) -> Result<std::fs::File> {
         let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if taken != 0 {
             bail!(
-                "el perfil {} ya lo usa otra ventana del navegador",
+                "el perfil {} está en uso por otra ventana del navegador",
                 profile.display()
             );
         }

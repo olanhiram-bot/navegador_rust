@@ -127,7 +127,7 @@ async fn un_perfil_en_uso_avisa_en_lugar_de_mezclar_sesiones() {
         .expect("el segundo navegador no debe usar el mismo perfil");
     let message = format!("{error:#}");
     assert!(
-        message.contains("ya lo usa otra ventana"),
+        message.contains("está en uso"),
         "el error debe explicar el conflicto de perfil: {message}"
     );
 }

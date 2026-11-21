@@ -61,6 +61,41 @@ pub fn session_path() -> Option<PathBuf> {
     Some(state_dir()?.join("sesion.json"))
 }
 
+pub fn settings_path() -> Option<PathBuf> {
+    Some(state_dir()?.join("ajustes.json"))
+}
+
+/// Preferencias que sobreviven al reinicio.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Settings {
+    /// Zoom por origen, p. ej. `https://ejemplo.com` → 1.25.
+    #[serde(default)]
+    pub zoom: std::collections::BTreeMap<String, f32>,
+}
+
+pub fn load_settings(path: &Path) -> Settings {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_settings(path: &Path, settings: &Settings) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, serde_json::to_vec_pretty(settings)?)?;
+    std::fs::rename(&temporary, path)
+}
+
+/// Clave estable del zoom: el origen de la URL, sin ruta ni consulta.
+pub fn zoom_key(url: &str) -> Option<String> {
+    let url = url::Url::parse(url).ok()?;
+    let origin = url.origin().ascii_serialization();
+    (origin != "null" && origin != "://").then_some(origin)
+}
+
 fn home() -> Option<String> {
     std::env::var("HOME").ok().filter(|home| !home.is_empty())
 }
@@ -169,6 +204,21 @@ mod tests {
             }],
             "las páginas en blanco no se restauran"
         );
+    }
+
+    #[test]
+    fn el_zoom_se_guarda_por_origen() {
+        assert_eq!(
+            zoom_key("https://ejemplo.com/ruta?q=1").as_deref(),
+            Some("https://ejemplo.com")
+        );
+        assert_eq!(zoom_key("about:blank"), None);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ajustes.json");
+        let mut settings = Settings::default();
+        settings.zoom.insert("https://ejemplo.com".into(), 1.25);
+        save_settings(&path, &settings).unwrap();
+        assert_eq!(load_settings(&path), settings);
     }
 
     #[test]
