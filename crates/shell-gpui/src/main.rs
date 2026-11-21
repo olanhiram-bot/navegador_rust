@@ -211,7 +211,7 @@ impl Shell {
         cx.notify();
     }
 
-    fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         let control = keystroke.modifiers.control || keystroke.modifiers.platform;
         let key = keystroke.key.as_str();
