@@ -10,7 +10,7 @@ use egui::{Align, Color32, Layout, Rect, Sense, Vec2};
 use engine_cdp::ElementRef;
 use session::{ActOutcome, Handoff};
 
-use crate::engine::{EngineHandle, Event, TabId, TabInfo};
+use crate::engine::{EngineHandle, Event, TabId, TabInfo, google_verification};
 
 const CHROME: Color32 = Color32::from_rgb(17, 18, 21);
 const TAB_ACTIVE: Color32 = Color32::from_rgb(45, 47, 54);
@@ -54,6 +54,7 @@ pub struct ShellApp {
     receipts: Receipts,
     elements: Vec<ElementRef>,
     generation: u32,
+    selection_origin: Option<egui::Pos2>,
     last_viewport: (Vec2, f32),
 }
 
@@ -92,6 +93,7 @@ impl ShellApp {
             receipts: Receipts::default(),
             elements: Vec::new(),
             generation: 0,
+            selection_origin: None,
             last_viewport: (Vec2::ZERO, 0.0),
         }
     }
@@ -117,6 +119,9 @@ impl ShellApp {
                     self.frames.remove(&id);
                 }
                 Event::Selected(active) => {
+                    latest_frame = None;
+                    self.selection_origin = None;
+                    self.last_viewport = (Vec2::ZERO, 0.0);
                     self.active = active;
                     self.pending = None;
                     self.result = None;
@@ -133,6 +138,7 @@ impl ShellApp {
                             );
                         }
                         None => {
+                            self.address.clear();
                             self.status = "sin pestañas · pulsa + para abrir una".to_string();
                             self.receipts = Receipts::default();
                         }
@@ -152,9 +158,14 @@ impl ShellApp {
                     if Some(tab) != self.active {
                         continue;
                     }
+                    if self.generation != info.generation {
+                        self.pending = None;
+                    }
                     self.generation = info.generation;
                     self.elements = elements;
-                    self.address = info.url.clone();
+                    if !ctx.memory(|m| m.has_focus(egui::Id::unique("address"))) {
+                        self.address = info.url.clone();
+                    }
                     self.status = format!(
                         "{} · generación {} · {} elementos",
                         if info.title.is_empty() {
@@ -210,6 +221,11 @@ impl ShellApp {
                         };
                     }
                 }
+                Event::CopyText(tab, text) => {
+                    if Some(tab) == self.active {
+                        ctx.copy_text(text);
+                    }
+                }
                 Event::Notice(notice) => self.status = notice,
                 Event::Error(error) => self.status = format!("error: {error}"),
             }
@@ -226,7 +242,13 @@ impl ShellApp {
         let css = Vec2::new(frame.css_width as f32, frame.css_height as f32);
         match self.frames.get_mut(&tab) {
             Some(existing) => {
-                existing.texture.set(image, texture_options());
+                if existing.texture.size() == image.size {
+                    existing
+                        .texture
+                        .set_partial([0, 0], image, texture_options());
+                } else {
+                    existing.texture.set(image, texture_options());
+                }
                 existing.css = css;
             }
             None => {
@@ -336,6 +358,13 @@ impl ShellApp {
         }
     }
 
+    fn open_external(&mut self, url: &str) {
+        self.status = match webbrowser::open(url) {
+            Ok(()) => "Página enviada al navegador del sistema".into(),
+            Err(error) => format!("error al abrir el navegador del sistema: {error}"),
+        };
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         let mut back = false;
         let mut forward = false;
@@ -348,7 +377,7 @@ impl ShellApp {
             reload = nav_button(ui, NavIcon::Reload, "Recargar");
             ui.add_space(4.0);
 
-            let omni_width = (ui.available_width() - 88.0).max(180.0);
+            let omni_width = (ui.available_width() - 175.0).max(80.0);
             egui::Frame::new()
                 .fill(OMNI)
                 .corner_radius(15.0)
@@ -356,19 +385,53 @@ impl ShellApp {
                 .show(ui, |ui| {
                     ui.set_width((omni_width - 26.0).max(120.0));
                     ui.horizontal(|ui| {
-                        security_glyph(ui, &self.address);
-                        let field = ui.add(
-                            egui::TextEdit::singleline(&mut self.address)
-                                .frame(egui::Frame::NONE)
-                                .desired_width(f32::INFINITY)
-                                .hint_text("Escribe una dirección"),
-                        );
+                        let current_url = self
+                            .tabs
+                            .iter()
+                            .find(|tab| Some(tab.id) == self.active)
+                            .map_or("", |tab| tab.url.as_str());
+                        security_glyph(ui, current_url);
+                        let focus =
+                            ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::L));
+                        let id = egui::Id::unique("address");
+                        if focus {
+                            ui.memory_mut(|m| m.request_focus(id));
+                        }
+                        let mut output = egui::TextEdit::singleline(&mut self.address)
+                            .frame(egui::Frame::NONE)
+                            .desired_width(f32::INFINITY)
+                            .id(id)
+                            .hint_text("Busca o escribe una dirección")
+                            .show(ui);
+                        if focus {
+                            output.state.cursor.set_char_range(Some(
+                                egui::text::CCursorRange::select_all(&output.galley),
+                            ));
+                            output.state.store(ui.ctx(), id);
+                        }
+                        let field = output.response;
                         if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             submit = true;
                         }
                     });
                 });
 
+            let external_url = self
+                .tabs
+                .iter()
+                .find(|tab| Some(tab.id) == self.active)
+                .map(|tab| tab.url.as_str())
+                .filter(|url| url.starts_with("https://") || url.starts_with("http://"));
+            if ui
+                .add_enabled(external_url.is_some(), egui::Button::new("Abrir fuera"))
+                .on_hover_text(
+                    "Abrir esta página en el navegador del sistema (sesión independiente)",
+                )
+                .clicked()
+                && let Some(url) = external_url.map(str::to_owned)
+            {
+                self.open_external(&url);
+            }
             if ui
                 .selectable_label(self.agent_open, egui::RichText::new("Agente").size(12.0))
                 .on_hover_text("Panel del agente")
@@ -650,18 +713,58 @@ impl ShellApp {
             return;
         };
 
+        let current_url = self
+            .tabs
+            .iter()
+            .find(|info| info.id == tab)
+            .map(|info| info.url.as_str())
+            .unwrap_or("");
+        if current_url == "about:blank" {
+            ui.add_space(ui.available_height() * 0.22);
+            ui.vertical_centered(|ui| {
+                ui.heading("Nueva pestaña");
+                ui.add_space(10.0);
+                if ui.button("Buscar o escribir una dirección").clicked() {
+                    self.address.clear();
+                    ui.memory_mut(|m| m.request_focus(egui::Id::unique("address")));
+                }
+            });
+            return;
+        }
+        if let Some(query) = google_verification(current_url) {
+            ui.add_space(8.0);
+            ui.group(|ui| {
+                ui.strong("Google solicita una verificación");
+                ui.label(
+                    "Completa la verificación en esta página o elige dónde continuar la búsqueda.",
+                );
+                ui.horizontal_wrapped(|ui| {
+                    let google = match &query {
+                        Some(text) => {
+                            format!("https://www.google.com/search?q={}", encode_query(text))
+                        }
+                        None => "https://www.google.com/".into(),
+                    };
+                    if ui.button("Abrir Google en el sistema").clicked() {
+                        self.open_external(&google);
+                    }
+                    if let Some(text) = query
+                        && ui.button("Buscar con DuckDuckGo").clicked()
+                    {
+                        self.handle
+                            .navigate(format!("https://duckduckgo.com/?q={}", encode_query(&text)));
+                    }
+                });
+            });
+        }
+
         let available = ui.available_size();
-        let target = egui::vec2(
-            (available.x - 24.0).max(320.0),
-            (available.y - 20.0).max(200.0),
-        );
+        let target = egui::vec2(available.x.max(320.0), available.y.max(240.0));
         // Nitidez sin reventar memoria: si el viewport a escala 2 supera el
         // presupuesto de píxeles, bajamos el deviceScaleFactor. Cada frame
         // RGBA cuesta width*height*4 y se nota en la fluidez.
-        // Por encima de 1.75 el coste por frame crece más rápido que la nitidez
-        // que aporta; el texto se sigue leyendo bien con mipmaps.
-        let mut scale = ui.ctx().pixels_per_point().min(1.75);
-        const BUDGET: f32 = 4_500_000.0;
+        let mut scale = ui.ctx().pixels_per_point().clamp(1.0, 3.0);
+        const BUDGET: f32 = 8_300_000.0;
         if target.x * target.y * scale * scale > BUDGET {
             scale = (BUDGET / (target.x * target.y)).sqrt().clamp(1.0, scale);
         }
@@ -694,7 +797,7 @@ impl ShellApp {
 
         let texture = frame.texture.id();
         ui.vertical_centered(|ui| {
-            let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+            let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
             ui.painter()
                 .rect_filled(rect.expand(1.0), 0.0, Color32::from_gray(46));
             ui.painter().image(
@@ -715,6 +818,31 @@ impl ShellApp {
                 }
             }
 
+            let primary = egui::PointerButton::Primary;
+            if response.drag_started_by(primary) {
+                self.selection_origin = ui.input(|i| i.pointer.press_origin());
+            }
+            let released = response.drag_stopped_by(primary);
+            if (released || response.dragged_by(primary))
+                && !self.agent_control
+                && self.pending.is_none()
+                && let Some(pointer) = response.interact_pointer_pos()
+                && let Some(origin) = self.selection_origin
+                && (released || response.drag_started() || response.drag_delta() != Vec2::ZERO)
+            {
+                response.request_focus();
+                let point = |p: egui::Pos2| {
+                    let pos = rect.clamp(p) - rect.min;
+                    [
+                        (pos.x / rect.width() * css.x) as f64,
+                        (pos.y / rect.height() * css.y) as f64,
+                    ]
+                };
+                self.handle.select_text(tab, point(origin), point(pointer));
+            }
+            if released {
+                self.selection_origin = None;
+            }
             if response.clicked()
                 && let Some(pointer) = response.interact_pointer_pos()
             {
@@ -745,8 +873,24 @@ impl ShellApp {
             return;
         }
         let events = ui.input(|input| input.events.clone());
+        let physical_space = events.iter().any(|event| {
+            matches!(
+                event,
+                egui::Event::Key {
+                    key: egui::Key::Space,
+                    pressed: true,
+                    ..
+                }
+            )
+        });
         for event in events {
             match event {
+                egui::Event::Text(text) if physical_space && text == " " => continue,
+                egui::Event::Copy => {
+                    if let Some(tab) = self.active {
+                        self.handle.copy_text(tab);
+                    }
+                }
                 egui::Event::Text(text) | egui::Event::Paste(text) => {
                     if !text.is_empty() {
                         self.handle.insert_text(text);
@@ -772,6 +916,18 @@ impl ShellApp {
 impl eframe::App for ShellApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_events(ui.ctx());
+        let shortcut = |key| ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, key));
+        if shortcut(egui::Key::T) {
+            self.handle.new_tab(None);
+        }
+        if shortcut(egui::Key::W)
+            && let Some(id) = self.active
+        {
+            self.handle.close_tab(id);
+        }
+        if shortcut(egui::Key::R) {
+            self.handle.reload();
+        }
 
         egui::Panel::top("chrome")
             .frame(
@@ -857,7 +1013,7 @@ fn texture_options() -> egui::TextureOptions {
         magnification: egui::TextureFilter::Linear,
         minification: egui::TextureFilter::Linear,
         wrap_mode: egui::TextureWrapMode::ClampToEdge,
-        mipmap_mode: Some(egui::TextureFilter::Linear),
+        mipmap_mode: None,
     }
 }
 
@@ -866,6 +1022,7 @@ fn texture_options() -> egui::TextureOptions {
 fn special_key(key: egui::Key) -> Option<(&'static str, &'static str, i64)> {
     use egui::Key::*;
     Some(match key {
+        Space => (" ", "Space", 32),
         Enter => ("Enter", "Enter", 13),
         Backspace => ("Backspace", "Backspace", 8),
         Delete => ("Delete", "Delete", 46),
@@ -927,13 +1084,13 @@ fn nav_button(ui: &mut egui::Ui, icon: NavIcon, tip: &str) -> bool {
             } else {
                 1.0
             };
-            let start = egui::pos2(center.x + dir * 5.5, center.y);
-            let end = egui::pos2(center.x - dir * 5.5, center.y);
+            let start = egui::pos2(center.x - dir * 5.5, center.y);
+            let end = egui::pos2(center.x + dir * 5.5, center.y);
             ui.painter().line_segment([start, end], stroke);
             ui.painter()
-                .line_segment([end, end + egui::vec2(dir * 4.2, -4.2)], stroke);
+                .line_segment([end, end + egui::vec2(-dir * 4.2, -4.2)], stroke);
             ui.painter()
-                .line_segment([end, end + egui::vec2(dir * 4.2, 4.2)], stroke);
+                .line_segment([end, end + egui::vec2(-dir * 4.2, 4.2)], stroke);
         }
         NavIcon::Reload => {
             let radius = 5.5;
@@ -985,6 +1142,12 @@ fn short_hash(hash: &str) -> &str {
 /// Lo que escribe la persona en la barra: URL si lo parece, búsqueda si no.
 pub fn browser_url(input: &str) -> String {
     let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return "about:blank".into();
+    }
+    if trimmed.starts_with("about:") || trimmed.starts_with("data:") {
+        return trimmed.to_string();
+    }
     let looks_like_url = trimmed.contains("://")
         || (!trimmed.contains(' ')
             && (trimmed.contains('.')
@@ -1033,6 +1196,25 @@ mod tests {
     use super::{browser_url, normalize_url};
 
     #[test]
+    fn recupera_solo_la_consulta_de_google() {
+        let url = "https://www.google.com/sorry/index?continue=https%3A%2F%2Fwww.google.com%2Fsearch%3Fq%3Dcaf%25C3%25A9%2Bfrio&q=token";
+        assert_eq!(
+            super::google_verification(url),
+            Some(Some("café frio".into()))
+        );
+        assert_eq!(
+            super::google_verification(
+                "https://www.google.com/sorry/index?continue=https://example.org/search?q=test"
+            ),
+            Some(None)
+        );
+        assert_eq!(
+            super::google_verification("https://www.google.com.example.org/sorry/index"),
+            None
+        );
+    }
+
+    #[test]
     fn completa_el_esquema_sin_romper_urls_explicitas() {
         assert_eq!(normalize_url("ejemplo.com"), "https://ejemplo.com");
         assert_eq!(normalize_url("127.0.0.1:8977/a"), "http://127.0.0.1:8977/a");
@@ -1047,6 +1229,8 @@ mod tests {
             browser_url("navegador ai rust"),
             "https://duckduckgo.com/?q=navegador+ai+rust"
         );
+        assert_eq!(browser_url("about:blank"), "about:blank");
+        assert_eq!(browser_url("   "), "about:blank");
         assert_eq!(browser_url("ejemplo.com"), "https://ejemplo.com");
         assert_eq!(browser_url("127.0.0.1:8977"), "http://127.0.0.1:8977");
     }

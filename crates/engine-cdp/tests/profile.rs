@@ -5,13 +5,26 @@ use engine_cdp::Chrome;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn el_perfil_es_efimero_y_se_borra_al_cerrar() {
-    let first = Chrome::launch().await.expect("Chromium debe lanzarse");
+    let mut first = Chrome::launch().await.expect("Chromium debe lanzarse");
     let first_dir = first.profile_dir().to_path_buf();
     assert!(first_dir.is_dir(), "el perfil debe existir: {first_dir:?}");
     assert!(
         first_dir.starts_with(std::env::temp_dir()),
         "el perfil debe vivir en un temporal: {first_dir:?}"
     );
+
+    if cfg!(target_os = "linux") {
+        first
+            .navigate("chrome://sandbox/")
+            .await
+            .expect("Chromium debe abrir su diagnóstico del sandbox");
+        let status = first.read_text().await.expect("leer el estado del sandbox");
+
+        assert!(
+            status.contains("You are adequately sandboxed."),
+            "Chromium debe confirmar que el sandbox está activo. Estado: {status:?}"
+        );
+    }
 
     drop(first);
     assert!(

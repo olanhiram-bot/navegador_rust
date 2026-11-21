@@ -16,6 +16,7 @@ use crate::cdp::Cdp;
 
 const EXTRACT_JS: &str = include_str!("extract.js");
 const SNAPSHOT_JS: &str = include_str!("snapshot.js");
+const ELEMENT_NAME_JS: &str = include_str!("element-name.js");
 const HIT_JS: &str = include_str!("hit.js");
 
 /// Chromium headless controlado por CDP.
@@ -28,10 +29,15 @@ pub struct Chrome {
     port: u16,
     cdp: Cdp,
     fetch_armed: bool,
+    interactive_navigation: bool,
 }
 
 impl Chrome {
     pub async fn launch() -> Result<Self> {
+        Self::launch_with_audio(false).await
+    }
+
+    pub async fn launch_with_audio(audio: bool) -> Result<Self> {
         let binary = find_binary()?;
         let profile = tempfile::tempdir().context("no se pudo crear el perfil temporal")?;
         let profile_path = profile.path().to_path_buf();
@@ -53,19 +59,21 @@ impl Chrome {
 
         let mut command = Command::new(&binary);
         command
-            .arg("--no-sandbox")
             .arg("--disable-dev-shm-usage")
             .arg("--disable-extensions")
             .arg("--disable-background-networking")
             .arg("--no-first-run")
             .arg("--no-default-browser-check")
-            .arg("--mute-audio")
             .arg("--hide-scrollbars")
             .arg("--window-size=1600,1000")
             .arg("--remote-debugging-port=0")
             .arg(format!("--user-data-dir={}", profile_path.display()))
             .arg("about:blank")
             .kill_on_drop(true);
+
+        if !audio {
+            command.arg("--mute-audio");
+        }
 
         match &display {
             Some(display) => {
@@ -89,10 +97,11 @@ impl Chrome {
         #[cfg(unix)]
         command.process_group(0);
 
-        let child = command
+        let mut child = command
             .spawn()
             .with_context(|| format!("no se pudo lanzar {}", binary.display()))?;
-        let port = wait_for_port(&profile_path, Duration::from_secs(20)).await?;
+        let port =
+            wait_for_port(&mut child, &binary, &profile_path, Duration::from_secs(20)).await?;
         let page_ws = page_target_ws(port).await?;
         let cdp = Cdp::connect(&page_ws).await?;
 
@@ -103,7 +112,14 @@ impl Chrome {
             port,
             cdp,
             fetch_armed: false,
+            interactive_navigation: false,
         })
+    }
+
+    pub async fn launch_for_shell() -> Result<Self> {
+        let mut chrome = Self::launch_with_audio(true).await?;
+        chrome.interactive_navigation = true;
+        Ok(chrome)
     }
 
     pub fn port(&self) -> u16 {
@@ -130,12 +146,22 @@ impl Chrome {
         }
         self.cdp.call("Page.enable", json!({})).await?;
         self.cdp.call("Runtime.enable", json!({})).await?;
-        self.cdp.call("Network.enable", json!({})).await?;
-        self.cdp
+        let previous_loader = if self.interactive_navigation {
+            self.cdp.call("Page.getFrameTree", json!({})).await?["frameTree"]["frame"]["loaderId"]
+                .clone()
+        } else {
+            Value::Null
+        };
+        let navigation = self
+            .cdp
             .call("Page.navigate", json!({ "url": url }))
             .await
             .with_context(|| format!("no se pudo navegar a {url}"))?;
 
+        if let Some(reason) = navigation.get("errorText").and_then(Value::as_str) {
+            bail!("Chromium no pudo cargar la página ({reason})");
+        }
+        let same_document = navigation["loaderId"].is_null();
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             if Instant::now() > deadline {
@@ -151,17 +177,19 @@ impl Chrome {
                     }),
                 )
                 .await?;
-            if value
-                .get("result")
-                .and_then(|r| r.get("value"))
-                .and_then(Value::as_str)
-                == Some("complete")
-            {
+            let ready = value["result"]["value"].as_str();
+            if self.interactive_navigation && matches!(ready, Some("interactive" | "complete")) {
+                let frame_tree = self.cdp.call("Page.getFrameTree", json!({})).await?;
+                if same_document || frame_tree["frameTree"]["frame"]["loaderId"] != previous_loader
+                {
+                    return Ok(());
+                }
+            } else if !self.interactive_navigation && ready == Some("complete") {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        // Deja que los scripts de la página terminen de correr.
+        // Los consumidores en modo agente toman el snapshot tras la carga.
         tokio::time::sleep(Duration::from_millis(120)).await;
         Ok(())
     }
@@ -174,7 +202,7 @@ impl Chrome {
         provenance: Provenance,
     ) -> Result<ActionDescriptor> {
         let expression = format!(
-            "({})({})",
+            "({})({}, {ELEMENT_NAME_JS})",
             EXTRACT_JS,
             serde_json::to_string(selector).expect("selector serializable")
         );
@@ -184,7 +212,12 @@ impl Chrome {
         if let Some(error) = value.get("error").and_then(Value::as_str) {
             bail!("extracción: {error} (selector {selector:?})");
         }
-        let raw: RawAction = serde_json::from_value(value).context("RawAction inválido")?;
+        let raw: RawAction = serde_path_to_error::deserialize(value).map_err(|error| {
+            anyhow::anyhow!(
+                "no se pudo interpretar el campo «{}» de la acción",
+                error.path()
+            )
+        })?;
         Ok(ActionDescriptor::from_raw(raw, provenance, generation))
     }
 
@@ -205,7 +238,7 @@ impl Chrome {
         let selector = serde_json::to_string(selector).context("serializar el selector")?;
         let expression = format!(
             "(function(s){{const el=document.querySelector(s); if(!el) return null; \
-             const a=el.closest('a[href]'); return a ? a.href : null;}})({selector})"
+             const a=el.closest('a[href]'); return JSON.stringify(a ? a.href : null);}})({selector})"
         );
         let text = self.evaluate_isolated(&expression).await?;
         let value: Value = serde_json::from_str(&text).context("JSON de enlace inválido")?;
@@ -233,6 +266,7 @@ impl Chrome {
                         "code": code,
                         "windowsVirtualKeyCode": virtual_key,
                         "nativeVirtualKeyCode": virtual_key,
+                        "text": if event_type == "keyDown" && code == "Space" && modifiers == 0 { " " } else { "" },
                         "modifiers": modifiers,
                     }),
                 )
@@ -264,7 +298,7 @@ impl Chrome {
     /// Foto de los elementos accionables, con refs `@eN` ligadas a `generation`.
     pub async fn snapshot(&mut self, generation: u32) -> Result<Snapshot> {
         let text = self
-            .evaluate_isolated(&format!("({SNAPSHOT_JS})()"))
+            .evaluate_isolated(&format!("({SNAPSHOT_JS})({ELEMENT_NAME_JS})"))
             .await?;
         let value: Value = serde_json::from_str(&text).context("JSON de snapshot inválido")?;
 
@@ -368,11 +402,7 @@ impl Chrome {
                 "Page.startScreencast",
                 json!({
                     "format": "jpeg",
-                    // 80 + tope: calidad suficiente para leer texto y frames
-                    // manejables para decodificar a 30 fps sin bloquear el motor.
-                    "quality": 80,
-                    "maxWidth": 1600,
-                    "maxHeight": 1000,
+                    "quality": 92,
                     "everyNthFrame": 1,
                 }),
             )
@@ -384,14 +414,26 @@ impl Chrome {
     /// píxeles y `scale` el devicePixelRatio: a 2 el texto llega nítido aunque
     /// la textura se dibuje más pequeña.
     pub async fn set_viewport(&self, width: u32, height: u32, scale: f64) -> Result<()> {
+        let scale = scale.clamp(1.0, 3.0);
         self.cdp
             .call(
                 "Emulation.setDeviceMetricsOverride",
                 json!({
                     "width": width.max(320),
                     "height": height.max(240),
-                    "deviceScaleFactor": scale.clamp(1.0, 3.0),
+                    "deviceScaleFactor": scale,
+                    "scale": scale,
+                    "dontSetVisibleSize": true,
                     "mobile": false,
+                }),
+            )
+            .await?;
+        self.cdp
+            .call(
+                "Emulation.setVisibleSize",
+                json!({
+                    "width": (width.max(320) as f64 * scale).round() as u32,
+                    "height": (height.max(240) as f64 * scale).round() as u32,
                 }),
             )
             .await?;
@@ -409,10 +451,16 @@ impl Chrome {
             .get("currentIndex")
             .and_then(Value::as_i64)
             .unwrap_or(0);
+        let Some(index) = current
+            .checked_add(delta)
+            .and_then(|index| usize::try_from(index).ok())
+        else {
+            return Ok(false);
+        };
         let entry_id = history
             .get("entries")
             .and_then(Value::as_array)
-            .and_then(|entries| entries.get((current + delta).max(0) as usize))
+            .and_then(|entries| entries.get(index))
             .and_then(|entry| entry.get("id"))
             .and_then(Value::as_i64);
 
@@ -631,10 +679,6 @@ impl Chrome {
                         }
                     }
                 }
-                Some("Network.requestWillBeSent") => {
-                    // Evidencia de defensa en profundidad. La decisión ya la tomó
-                    // `Fetch` antes de que la petición saliera.
-                }
                 _ => {}
             }
         }
@@ -738,6 +782,23 @@ impl engine::Transport for Chrome {
         Chrome::link_href(self, selector)
     }
 
+    async fn youtube_search_query(&self, selector: &str) -> Result<Option<String>> {
+        let selector = serde_json::to_string(selector)?;
+        let expression = format!(
+            r#"(() => {{
+            if (location.origin !== 'https://www.youtube.com') return null;
+            const button = document.querySelector({selector});
+            const box = button?.closest('yt-searchbox, ytd-searchbox');
+            if (!box || !button.matches('button.ytSearchboxComponentSearchButton, #search-icon-legacy')) return null;
+            const input = box.querySelector('input[name="search_query"]');
+            return JSON.stringify(input ? input.value.trim() : null);
+        }})()"#
+        );
+        Ok(serde_json::from_str(
+            &self.evaluate_isolated(&expression).await?,
+        )?)
+    }
+
     fn insert_text(&mut self, text: &str) -> impl std::future::Future<Output = Result<()>> + Send {
         Chrome::insert_text(self, text)
     }
@@ -750,6 +811,27 @@ impl engine::Transport for Chrome {
         modifiers: u32,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
         Chrome::key(self, key, code, virtual_key, modifiers)
+    }
+
+    async fn select_text(&self, start: [f64; 2], end: [f64; 2]) -> Result<()> {
+        let expression = format!(
+            r#"(() => {{
+            const start = document.caretRangeFromPoint({}, {});
+            const end = document.caretRangeFromPoint({}, {});
+            if (start && end) window.getSelection().setBaseAndExtent(
+                start.startContainer, start.startOffset, end.startContainer, end.startOffset
+            );
+            return true;
+        }})()"#,
+            start[0], start[1], end[0], end[1]
+        );
+        self.evaluate_isolated(&expression).await?;
+        Ok(())
+    }
+
+    async fn selected_text(&self) -> Result<String> {
+        self.evaluate_isolated("window.getSelection().toString()")
+            .await
     }
 
     fn click_at(&mut self, x: f64, y: f64) -> impl std::future::Future<Output = Result<()>> + Send {
@@ -872,10 +954,24 @@ fn find_binary() -> Result<PathBuf> {
     bail!("no se encontró Chromium; define NAVEGADOR_CHROME")
 }
 
-async fn wait_for_port(profile: &std::path::Path, timeout: Duration) -> Result<u16> {
+async fn wait_for_port(
+    child: &mut Child,
+    binary: &Path,
+    profile: &Path,
+    timeout: Duration,
+) -> Result<u16> {
     let file = profile.join("DevToolsActivePort");
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("no se pudo consultar el estado de {}", binary.display()))?
+        {
+            bail!(
+                "{} terminó antes de publicar DevToolsActivePort ({status})",
+                binary.display()
+            );
+        }
         if let Ok(contents) = std::fs::read_to_string(&file)
             && let Some(port) = contents
                 .lines()
@@ -958,4 +1054,33 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn el_arranque_reporta_si_chromium_termina_antes_de_publicar_el_puerto() {
+        let binary = Path::new("/bin/sh");
+        let profile = tempfile::tempdir().unwrap();
+        let mut child = Command::new(binary)
+            .args(["-c", "exit 7"])
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_port(&mut child, binary, profile.path(), Duration::from_secs(20)),
+        )
+        .await
+        .expect("la salida del proceso debe reportarse antes del timeout de arranque")
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "/bin/sh terminó antes de publicar DevToolsActivePort (exit status: 7)"
+        );
+    }
 }

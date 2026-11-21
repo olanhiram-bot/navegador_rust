@@ -511,6 +511,13 @@ impl<E: Engine + Transport> Session<E> {
         Ok(self.engine.link_href(selector).await?)
     }
 
+    pub async fn youtube_search_query(
+        &self,
+        selector: &str,
+    ) -> Result<Option<String>, SessionError> {
+        Ok(self.engine.youtube_search_query(selector).await?)
+    }
+
     pub async fn insert_text(&mut self, text: &str) -> Result<(), SessionError> {
         self.engine.insert_text(text).await?;
         Ok(())
@@ -527,6 +534,14 @@ impl<E: Engine + Transport> Session<E> {
         Ok(())
     }
 
+    pub async fn select_text(&self, start: [f64; 2], end: [f64; 2]) -> Result<(), SessionError> {
+        Ok(self.engine.select_text(start, end).await?)
+    }
+
+    pub async fn selected_text(&self) -> Result<String, SessionError> {
+        Ok(self.engine.selected_text().await?)
+    }
+
     /// Click de foco para campos de texto; nunca para botones.
     pub async fn click_at(&mut self, x: f64, y: f64) -> Result<(), SessionError> {
         self.engine.click_at(x, y).await?;
@@ -536,6 +551,14 @@ impl<E: Engine + Transport> Session<E> {
     pub async fn scroll(&mut self, x: f64, y: f64, delta_y: f64) -> Result<(), SessionError> {
         self.engine.scroll(x, y, delta_y).await?;
         Ok(())
+    }
+
+    /// Destino de un enlace visible que acaba de aparecer en el DOM.
+    pub async fn link_at(&mut self, x: f64, y: f64) -> Result<Option<String>, SessionError> {
+        let Some(selector) = self.engine.hit_test(x, y).await? else {
+            return Ok(None);
+        };
+        Ok(self.engine.link_href(&selector).await?)
     }
 
     /// Elemento accionable bajo un punto, solo si sigue en el snapshot vivo.

@@ -23,7 +23,7 @@ fn main() -> eframe::Result<()> {
                     std::process::exit(2);
                 }));
             }
-            other => url = other.to_string(),
+            other => url = shell::app::browser_url(other),
         }
     }
 

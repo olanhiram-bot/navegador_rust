@@ -1,4 +1,4 @@
-function (selector) {
+function (selector, nameOf) {
   const el = document.querySelector(selector);
   if (!el) {
     return JSON.stringify({ error: 'selector_not_found', selector });
@@ -23,15 +23,17 @@ function (selector) {
       .join(' | ')
   ).slice(0, 600);
 
-  const fields = {};
+  const fields = Object.create(null);
   let actionUrl = null;
   let method = null;
   let file = null;
 
   if (form) {
-    actionUrl = form.action || location.href;
-    method = (form.getAttribute('method') || 'get').toUpperCase();
-    for (const field of Array.from(form.elements)) {
+    // Los controles con nombre pueden ocultar propiedades de la instancia.
+    const formProperty = (key) => Reflect.get(HTMLFormElement.prototype, key, form);
+    actionUrl = formProperty('action') || location.href;
+    method = formProperty('method').toUpperCase();
+    for (const field of Array.from(formProperty('elements'))) {
       if (!field.name) continue;
       const fieldType = (field.type || '').toLowerCase();
       if (['submit', 'button', 'reset', 'image'].includes(fieldType)) continue;
@@ -84,7 +86,7 @@ function (selector) {
     target: {
       selector,
       tag,
-      name: clean(el.innerText || el.value || ''),
+      name: nameOf(el),
       x: rect.x + rect.width / 2,
       y: rect.y + rect.height / 2,
     },

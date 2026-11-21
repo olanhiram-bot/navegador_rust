@@ -160,6 +160,11 @@ pub trait Transport {
         selector: &str,
     ) -> impl Future<Output = anyhow::Result<Option<String>>> + Send;
 
+    fn youtube_search_query(
+        &self,
+        selector: &str,
+    ) -> impl Future<Output = anyhow::Result<Option<String>>> + Send;
+
     /// Texto compuesto por el teclado; respeta la distribución del sistema.
     fn insert_text(&mut self, text: &str) -> impl Future<Output = anyhow::Result<()>> + Send;
 
@@ -171,6 +176,13 @@ pub trait Transport {
         virtual_key: i64,
         modifiers: u32,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
+
+    fn select_text(
+        &self,
+        start: [f64; 2],
+        end: [f64; 2],
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
+    fn selected_text(&self) -> impl Future<Output = anyhow::Result<String>> + Send;
 
     /// Click real para enfocar un campo; los botones no pasan por aquí.
     fn click_at(&mut self, x: f64, y: f64) -> impl Future<Output = anyhow::Result<()>> + Send;

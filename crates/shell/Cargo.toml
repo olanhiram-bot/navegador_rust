@@ -9,6 +9,8 @@ name = "navegador-shell"
 path = "src/main.rs"
 
 [dependencies]
+url.workspace = true
+webbrowser = "1"
 anyhow.workspace = true
 base64.workspace = true
 card = { path = "../card" }

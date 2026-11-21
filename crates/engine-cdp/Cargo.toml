@@ -12,6 +12,7 @@ engine = { path = "../engine" }
 futures-util.workspace = true
 libc.workspace = true
 serde_json.workspace = true
+serde_path_to_error = "0.1"
 tempfile.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true

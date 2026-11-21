@@ -17,8 +17,8 @@ use engine_cdp::{Chrome, ElementRef};
 use receipt::{Identity, ReceiptLog};
 use serde_json::Value;
 use session::{ActOptions, ActOutcome, Handoff, Session, SessionConfig};
-use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::watch;
 
 pub type TabId = u64;
 
@@ -78,6 +78,7 @@ pub enum Event {
         last: Option<String>,
         log: PathBuf,
     },
+    CopyText(TabId, String),
     Notice(String),
     Error(String),
 }
@@ -102,6 +103,8 @@ pub enum Command {
         y: f64,
         delta_y: f64,
     },
+    SelectText(TabId, [f64; 2], [f64; 2]),
+    CopyText(TabId),
     Click {
         x: f64,
         y: f64,
@@ -167,6 +170,14 @@ impl EngineHandle {
 
     pub fn wheel(&self, x: f64, y: f64, delta_y: f64) {
         let _ = self.commands.send(Command::Wheel { x, y, delta_y });
+    }
+
+    pub fn select_text(&self, tab: TabId, start: [f64; 2], end: [f64; 2]) {
+        let _ = self.commands.send(Command::SelectText(tab, start, end));
+    }
+
+    pub fn copy_text(&self, tab: TabId) {
+        let _ = self.commands.send(Command::CopyText(tab));
     }
 
     pub fn click(&self, x: f64, y: f64) {
@@ -264,6 +275,7 @@ struct Pending {
 }
 
 struct Tab {
+    capture_scale: f64,
     session: Session<Chrome>,
     log_path: PathBuf,
     pending: Option<Pending>,
@@ -288,6 +300,8 @@ fn run(
         .context("crear el runtime del motor")?;
 
     runtime.block_on(async move {
+        let (frames, frame_rx) = watch::channel(None);
+        tokio::spawn(decode_frames(frame_rx, events.clone()));
         let mut state = State {
             tabs: BTreeMap::new(),
             active: None,
@@ -295,50 +309,76 @@ fn run(
             log_base: log_path,
         };
 
-        open_tab(&mut state, &initial_url, &events).await?;
+        if let Err(error) = open_tab(&mut state, &initial_url, &events).await {
+            events.emit(Event::Error(format!("{error:#}")));
+        }
 
         loop {
-            loop {
-                match commands.try_recv() {
-                    Ok(command) => match handle_command(&mut state, command, &events).await {
+            let input = if let Some(tab) = active_tab(&mut state) {
+                tokio::select! {
+                    command = commands.recv() => EngineInput::Command(command),
+                    event = tab.session.next_event(Duration::from_millis(10)) => EngineInput::Browser(event?),
+                }
+            } else {
+                EngineInput::Command(commands.recv().await)
+            };
+
+            match input {
+                EngineInput::Command(None) => return Ok(()),
+                EngineInput::Command(Some(command)) => {
+                    match handle_command(&mut state, command, &events).await {
                         Ok(true) => return Ok(()),
                         Ok(false) => {}
-                        // Un comando fallido no tumba el motor ni las demás pestañas.
-                        Err(error) => {
-                            let _ = events.emit(Event::Error(format!("{error:#}")));
-                        }
-                    },
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => return Ok(()),
+                        Err(error) => events.emit(Event::Error(format!("{error:#}"))),
+                    }
                 }
+                EngineInput::Browser(Some(event)) => {
+                    let id = state.active.expect("evento de la pestaña activa");
+                    handle_browser_event(&mut state, id, event, &events, &frames).await;
+                }
+                EngineInput::Browser(None) => {}
             }
 
-            let ids: Vec<TabId> = std::iter::once(state.active)
-                .flatten()
-                .chain(
-                    state
-                        .tabs
-                        .keys()
-                        .copied()
-                        .filter(|id| Some(*id) != state.active),
-                )
-                .collect();
-
-            for id in ids {
-                let event = {
-                    let Some(tab) = state.tabs.get_mut(&id) else {
-                        continue;
-                    };
-                    tab.session.next_event(Duration::from_millis(10)).await?
-                };
-                if let Some(event) = event
-                    && event.get("method").and_then(Value::as_str) == Some("Page.screencastFrame")
-                {
-                    handle_frame(&mut state, id, &event, &events).await;
+            let background_tabs: Vec<_> = state.tabs.keys().copied().filter(|id| Some(*id) != state.active).collect();
+            for id in background_tabs {
+                let tab = state.tabs.get_mut(&id).expect("pestaña existente");
+                if let Some(event) = tab.session.next_event(Duration::ZERO).await? {
+                    handle_browser_event(&mut state, id, event, &events, &frames).await;
                 }
             }
         }
     })
+}
+
+enum EngineInput {
+    Command(Option<Command>),
+    Browser(Option<Value>),
+}
+
+async fn handle_browser_event(
+    state: &mut State,
+    id: TabId,
+    mut event: Value,
+    events: &Emitter,
+    frames: &watch::Sender<Option<Arc<EncodedFrame>>>,
+) {
+    match event["method"].as_str() {
+        Some("Page.screencastFrame") => {
+            let tab = state.tabs.get_mut(&id).expect("pestaña existente");
+            if Some(id) == state.active
+                && let Some(frame) = EncodedFrame::from_event(id, tab.capture_scale, &mut event)
+            {
+                frames.send_replace(Some(Arc::new(frame)));
+            }
+            if let Some(session_id) = event["params"]["sessionId"].as_i64() {
+                tab.session.ack_screencast_frame(session_id).await.ok();
+            }
+        }
+        Some("Page.domContentEventFired" | "Page.navigatedWithinDocument") => {
+            refresh_after_page_navigation(state, id, events).await;
+        }
+        _ => {}
+    }
 }
 
 /// `true` significa cerrar la shell.
@@ -361,11 +401,30 @@ async fn handle_command(state: &mut State, command: Command, events: &Emitter) -
         } => {
             if let Some(tab) = active_tab(state) {
                 tab.session.set_viewport(width, height, scale).await?;
+                tab.capture_scale = scale.clamp(1.0, 3.0);
+                if tab.pending.is_none()
+                    && let Some(id) = state.active
+                {
+                    refresh_snapshot(state, id, events).await?;
+                }
             }
         }
         Command::Wheel { x, y, delta_y } => {
             if let Some(tab) = active_tab(state) {
                 tab.session.scroll(x, y, delta_y).await?;
+            }
+        }
+        Command::SelectText(id, start, end) => {
+            if state.active == Some(id) {
+                state.tabs[&id].session.select_text(start, end).await?;
+            }
+        }
+        Command::CopyText(id) => {
+            if state.active == Some(id) {
+                let text = state.tabs[&id].session.selected_text().await?;
+                if !text.is_empty() {
+                    events.emit(Event::CopyText(id, text));
+                }
             }
         }
         Command::Click { x, y } => click(state, x, y, events).await?,
@@ -382,11 +441,6 @@ async fn handle_command(state: &mut State, command: Command, events: &Emitter) -
         } => {
             if let Some(tab) = active_tab(state) {
                 tab.session.key(&key, &code, virtual_key, modifiers).await?;
-            }
-            // Enter puede enviar un formulario; si la URL cambia, refrescamos
-            // snapshot y dirección en vez de quedarnos con el DOM anterior.
-            if key == "Enter" {
-                refresh_after_enter(state, events).await?;
             }
         }
         Command::Approve { hash } => approve(state, &hash, events).await?,
@@ -406,7 +460,9 @@ async fn open_tab(state: &mut State, url: &str, events: &Emitter) -> Result<TabI
     let log_path = tab_log_path(&state.log_base, id);
     let log =
         ReceiptLog::open(&log_path).with_context(|| format!("abrir el log de la pestaña {id}"))?;
-    let chrome = Chrome::launch().await.context("lanzar Chromium")?;
+    let chrome = Chrome::launch_for_shell()
+        .await
+        .context("lanzar Chromium")?;
     let mut session = Session::new(
         chrome,
         Identity::generate().context("generar la identidad local")?,
@@ -425,10 +481,14 @@ async fn open_tab(state: &mut State, url: &str, events: &Emitter) -> Result<TabI
         elements: snapshot.elements.len(),
     };
     let elements = snapshot.elements.clone();
+    if let Some(previous) = active_tab(state) {
+        previous.session.stop_screencast().await.ok();
+    }
     state.active = Some(id);
     state.tabs.insert(
         id,
         Tab {
+            capture_scale: 1.0,
             session,
             log_path,
             pending: None,
@@ -502,6 +562,7 @@ async fn select_tab(state: &mut State, id: TabId, events: &Emitter) -> Result<()
 
 async fn navigate(state: &mut State, url: &str, events: &Emitter) -> Result<()> {
     let Some(id) = state.active else {
+        open_tab(state, url, events).await?;
         return Ok(());
     };
     let info = {
@@ -510,7 +571,6 @@ async fn navigate(state: &mut State, url: &str, events: &Emitter) -> Result<()> 
         };
         let snapshot = tab.session.open(url).await?;
         tab.pending = None;
-        tab.session.start_screencast().await.ok();
         (snapshot_info(&snapshot), snapshot.elements)
     };
     let _ = events.emit(Event::Snapshot {
@@ -596,52 +656,48 @@ async fn wait_for_url_change(
     }
 }
 
-/// Tras Enter, espera a que la navegación cambie la URL. Si no cambia (por
-/// ejemplo, un campo sin formulario) no toca el snapshot vivo.
-async fn refresh_after_enter(state: &mut State, events: &Emitter) -> Result<()> {
-    let Some(id) = state.active else {
-        return Ok(());
-    };
-    let previous = state
-        .tabs
-        .get(&id)
-        .and_then(|tab| tab.session.url().map(str::to_string));
-    let Some(previous) = previous else {
-        return Ok(());
-    };
-
-    for _ in 0..6 {
-        tokio::time::sleep(Duration::from_millis(120)).await;
-        let snapshot = {
-            let Some(tab) = state.tabs.get_mut(&id) else {
-                return Ok(());
-            };
-            tab.session.snapshot().await.ok()
-        };
-        let Some(snapshot) = snapshot else {
-            continue;
-        };
-        if snapshot.url == previous {
-            continue;
-        }
-        if let Some(tab) = state.tabs.get_mut(&id) {
-            tab.pending = None;
-        }
-        events.emit(Event::Snapshot {
-            tab: id,
-            info: snapshot_info(&snapshot),
-            elements: snapshot.elements,
-        });
-        send_receipts(state, id, events);
-        return Ok(());
+// Some(None) indica una verificación sin búsqueda recuperable.
+pub(crate) fn google_verification(address: &str) -> Option<Option<String>> {
+    let url = url::Url::parse(address).ok()?;
+    if url.scheme() != "https"
+        || url.host_str() != Some("www.google.com")
+        || !url.path().starts_with("/sorry/")
+    {
+        return None;
     }
-    Ok(())
+    let query = url
+        .query_pairs()
+        .find(|(key, _)| key == "continue")
+        .and_then(|(_, value)| url::Url::parse(&value).ok())
+        .filter(|next| next.origin() == url.origin() && next.path() == "/search")
+        .and_then(|next| {
+            next.query_pairs()
+                .find(|(key, _)| key == "q")
+                .map(|(_, value)| value.into_owned())
+        });
+    Some(query)
 }
 
 async fn click(state: &mut State, x: f64, y: f64, events: &Emitter) -> Result<()> {
     let Some(id) = state.active else {
         return Ok(());
     };
+    // El gesto lo envía el puntero humano. Chromium enruta el click al marco de la verificación.
+    let tab = state.tabs.get_mut(&id).expect("pestaña activa");
+    if tab.pending.is_none() && tab.session.url().and_then(google_verification).is_some() {
+        // Confirma el documento vivo antes de enviar el clic, también tras una redirección.
+        let current = tab.session.snapshot().await?;
+        if google_verification(&current.url).is_some() {
+            tab.session.click_at(x, y).await?;
+        } else {
+            events.emit(Event::Snapshot {
+                tab: id,
+                info: snapshot_info(&current),
+                elements: current.elements,
+            });
+        }
+        return Ok(());
+    }
     let element = {
         let Some(tab) = state.tabs.get_mut(&id) else {
             return Ok(());
@@ -650,14 +706,37 @@ async fn click(state: &mut State, x: f64, y: f64, events: &Emitter) -> Result<()
     };
 
     let Some(element) = element else {
-        let _ = events.emit(Event::Notice(
-            "no hay un elemento accionable en ese punto".into(),
-        ));
+        let tab = state.tabs.get_mut(&id).expect("pestaña activa");
+        if let Some(href) = tab.session.link_at(x, y).await?
+            && (href.starts_with("https://") || href.starts_with("http://"))
+        {
+            return navigate(state, &href, events).await;
+        }
+        tab.session.select_text([x, y], [x, y]).await?;
+        events.emit(Event::Notice("listo".into()));
         return Ok(());
     };
 
     match element.role.as_str() {
-        "button" => {}
+        "button" => {
+            let tab = &state.tabs[&id];
+            if tab
+                .session
+                .url()
+                .is_some_and(|url| url.starts_with("https://www.youtube.com/"))
+                && let Some(query) = tab.session.youtube_search_query(&element.selector).await?
+            {
+                if query.is_empty() {
+                    events.emit(Event::Notice("Escribe lo que quieres buscar".into()));
+                    return Ok(());
+                }
+                let destination = url::Url::parse_with_params(
+                    "https://www.youtube.com/results",
+                    [("search_query", query)],
+                )?;
+                return navigate(state, destination.as_str(), events).await;
+            }
+        }
         "link" => {
             let href = {
                 let tab = state.tabs.get_mut(&id).expect("pestaña activa");
@@ -702,7 +781,13 @@ async fn click(state: &mut State, x: f64, y: f64, events: &Emitter) -> Result<()
     };
     let outcome = {
         let tab = state.tabs.get_mut(&id).expect("pestaña activa");
-        tab.session.act(&element.reference, options.clone()).await?
+        match tab.session.act(&element.reference, options.clone()).await {
+            Err(error @ session::SessionError::ElementChanged(_)) => {
+                refresh_snapshot(state, id, events).await?;
+                return Err(error.into());
+            }
+            result => result?,
+        }
     };
 
     settle_act(state, id, &element.reference, options, outcome, events).await
@@ -828,59 +913,81 @@ fn send_receipts(state: &State, id: TabId, events: &Emitter) {
     });
 }
 
-async fn handle_frame(state: &mut State, tab: TabId, event: &Value, events: &Emitter) {
-    let params = &event["params"];
-    let Some(session_id) = params.get("sessionId").and_then(Value::as_i64) else {
-        return;
-    };
-    let Some(data) = params.get("data").and_then(Value::as_str) else {
-        return;
-    };
-    let metadata = params.get("metadata").cloned().unwrap_or(Value::Null);
-    let css_width = metadata
-        .get("deviceWidth")
-        .and_then(Value::as_f64)
-        .unwrap_or(1024.0);
-    let css_height = metadata
-        .get("deviceHeight")
-        .and_then(Value::as_f64)
-        .unwrap_or(768.0);
+struct EncodedFrame {
+    tab: TabId,
+    jpeg: String,
+    css_width: f64,
+    css_height: f64,
+}
 
-    // Decodificar un JPEG de varios megapíxeles es CPU pura: lo sacamos del
-    // hilo async para no retrasar comandos mientras llega el siguiente frame.
-    let started = Instant::now();
-    let encoded_bytes = data.len();
-    let encoded = data.to_string();
-    let decoded = tokio::task::spawn_blocking(move || {
-        let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)?;
-        let image = image::load_from_memory(&bytes)?;
-        Ok::<_, anyhow::Error>(image.to_rgba8())
-    })
-    .await;
-
-    if let Ok(Ok(rgba)) = decoded {
-        let (width, height) = rgba.dimensions();
-        if std::env::var_os("NAVEGADOR_FRAME_LOG").is_some() {
-            eprintln!(
-                "frame {width}x{height} jpeg={} KB decode={:?}",
-                encoded_bytes / 1024,
-                started.elapsed()
-            );
-        }
-        let _ = events.emit(Event::Frame {
+impl EncodedFrame {
+    fn from_event(tab: TabId, capture_scale: f64, event: &mut Value) -> Option<Self> {
+        let params = &mut event["params"];
+        let Value::String(jpeg) = params["data"].take() else {
+            return None;
+        };
+        let metadata = &params["metadata"];
+        Some(Self {
             tab,
-            frame: Frame {
-                width: width as usize,
-                height: height as usize,
-                rgba: rgba.into_raw(),
-                css_width,
-                css_height,
-            },
-        });
+            jpeg,
+            css_width: metadata["deviceWidth"].as_f64().unwrap_or(1024.0) / capture_scale,
+            css_height: metadata["deviceHeight"].as_f64().unwrap_or(768.0) / capture_scale,
+        })
     }
 
-    if let Some(tab) = state.tabs.get_mut(&tab) {
-        let _ = tab.session.ack_screencast_frame(session_id).await;
+    fn decode(&self) -> Result<Frame> {
+        let bytes = base64::engine::general_purpose::STANDARD.decode(&self.jpeg)?;
+        let rgba =
+            image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg)?.into_rgba8();
+        let (width, height) = rgba.dimensions();
+        Ok(Frame {
+            width: width as usize,
+            height: height as usize,
+            rgba: rgba.into_raw(),
+            css_width: self.css_width,
+            css_height: self.css_height,
+        })
+    }
+}
+
+async fn decode_frames(mut frames: watch::Receiver<Option<Arc<EncodedFrame>>>, events: Emitter) {
+    let log_timing = std::env::var_os("NAVEGADOR_FRAME_LOG").is_some();
+    while frames.changed().await.is_ok() {
+        let Some(encoded) = frames.borrow_and_update().clone() else {
+            continue;
+        };
+        let tab = encoded.tab;
+        let started = Instant::now();
+        let encoded_bytes = encoded.jpeg.len();
+        if let Ok(Ok(frame)) = tokio::task::spawn_blocking(move || encoded.decode()).await {
+            if log_timing {
+                eprintln!(
+                    "frame {}x{} jpeg={} KB decode={:?}",
+                    frame.width,
+                    frame.height,
+                    encoded_bytes / 1024,
+                    started.elapsed()
+                );
+            }
+            events.emit(Event::Frame { tab, frame });
+        }
+    }
+}
+
+async fn refresh_after_page_navigation(state: &mut State, id: TabId, events: &Emitter) {
+    let tab = state.tabs.get_mut(&id).expect("pestaña existente");
+    let previous = tab.session.url().map(str::to_owned);
+    // Una notificación de Chromium puede llegar después de que otro comando
+    // ya haya actualizado la sesión. Contrasta con el documento vivo.
+    if let Ok(snapshot) = tab.session.snapshot().await
+        && previous.as_deref() != Some(&snapshot.url)
+    {
+        tab.pending = None;
+        tab.session.refresh();
+        if let Err(error) = refresh_snapshot(state, id, events).await {
+            events.emit(Event::Error(format!("{error:#}")));
+        }
+        send_receipts(state, id, events);
     }
 }
 

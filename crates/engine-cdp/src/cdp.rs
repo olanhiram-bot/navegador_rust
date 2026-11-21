@@ -1,7 +1,7 @@
 //! Cliente CDP mínimo sobre WebSocket.
 //!
 //! No usamos `chromiumoxide` aquí a propósito: necesitamos control exacto de
-//! `Fetch.requestPaused` (binding antes de enviar) y de `Network.*`.
+//! `Fetch.requestPaused` (binding antes de enviar) y de los eventos de navegación.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -66,7 +66,17 @@ impl Cdp {
                         }
                     }
                     None => {
-                        let _ = events_tx.send(value);
+                        if matches!(
+                            value["method"].as_str(),
+                            Some(
+                                "Fetch.requestPaused"
+                                    | "Page.screencastFrame"
+                                    | "Page.navigatedWithinDocument"
+                                    | "Page.domContentEventFired"
+                            )
+                        ) {
+                            let _ = events_tx.send(value);
+                        }
                     }
                 }
             }
@@ -105,6 +115,9 @@ impl Cdp {
 
     /// Espera el siguiente evento. `None` si la conexión terminó.
     pub async fn next_event(&mut self, timeout: Duration) -> Result<Option<Value>> {
+        if timeout.is_zero() {
+            return Ok(self.events.try_recv().ok());
+        }
         match tokio::time::timeout(timeout, self.events.recv()).await {
             Ok(Some(event)) => Ok(Some(event)),
             Ok(None) => Ok(None),

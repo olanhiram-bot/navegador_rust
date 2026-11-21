@@ -238,5 +238,143 @@ fn las_pestanas_comparten_ventana_y_se_pueden_cerrar() {
         |event| matches!(event, Event::TabClosed(id) if *id == second),
     );
 
+    handle.close_tab(first);
+    wait_for(&handle, 10, |event| matches!(event, Event::Selected(None)));
+    handle.navigate(server.page_url("settings.html"));
+    wait_for(
+        &handle,
+        20,
+        |event| matches!(event, Event::Snapshot { tab, info, .. } if *tab != first && info.url.ends_with("settings.html")),
+    );
+
+    handle.shutdown();
+}
+
+#[test]
+fn seleccion_copia_y_enlace_con_pantalla_de_alta_densidad() {
+    let server = navegador::FixtureServer::start();
+    let destination = server.page_url("shop.html");
+    let url = format!(
+        "data:text/html,<body style='margin:0'><p style='margin:0;font:20px monospace'>Seleccionable</p><a href='{destination}'>Abrir</a><div style='position:absolute;left:300px;top:100px;width:20px;height:20px;background:red'></div>"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let handle = spawn(url, dir.path().join("log"));
+    let (tab, _) = first_snapshot(&handle);
+    handle.viewport(1000, 600, 2.0);
+    let frame = wait_for(
+        &handle,
+        10,
+        |event| matches!(event, Event::Frame {frame,..} if frame.width == 2000 && frame.height == 1200),
+    );
+    if let Event::Frame { frame, .. } = frame {
+        let offset = 4 * (210 * frame.width + 610);
+        assert!(
+            frame.rgba[offset] > 220 && frame.rgba[offset + 1] < 40,
+            "posición física incorrecta"
+        );
+        assert_eq!((frame.css_width, frame.css_height), (1000.0, 600.0));
+    }
+    handle.select_text(tab, [0.0, 10.0], [250.0, 10.0]);
+    handle.copy_text(tab);
+    wait_for(
+        &handle,
+        5,
+        |event| matches!(event, Event::CopyText(_, text) if text == "Seleccionable"),
+    );
+    handle.click(15.0, 32.0);
+    wait_for(
+        &handle,
+        10,
+        |event| matches!(event, Event::Snapshot {info,..} if info.url == destination),
+    );
+    handle.shutdown();
+}
+
+#[test]
+fn una_redireccion_tardia_actualiza_la_barra() {
+    let server = navegador::FixtureServer::start();
+    let destination = server.page_url("shop.html");
+    let initial = format!(
+        "data:text/html,<a href='{destination}'>Abrir</a><script>setTimeout(()=>location.replace('{destination}'),1800)</script>"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let handle = spawn(initial, dir.path().join("log"));
+    let (tab, _) = first_snapshot(&handle);
+    wait_for(
+        &handle,
+        10,
+        |event| matches!(event, Event::Snapshot {tab: id, info, ..} if *id == tab && info.url == destination),
+    );
+    handle.shutdown();
+}
+
+#[test]
+fn se_abre_un_enlace_que_aparece_despues_del_snapshot() {
+    let server = navegador::FixtureServer::start();
+    let destination = server.page_url("shop.html");
+    let initial = format!(
+        "data:text/html,<body style='margin:0'><button>Inicio</button><script>setTimeout(()=>{{const a=document.createElement('a');a.href='{destination}';a.innerText='Video';a.style='position:absolute;left:0;top:50px';document.body.append(a)}},1000)</script>"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let handle = spawn(initial, dir.path().join("log"));
+    first_snapshot(&handle);
+    std::thread::sleep(Duration::from_millis(1300));
+    handle.click(9.0, 58.0);
+    wait_for(
+        &handle,
+        10,
+        |event| matches!(event,Event::Snapshot {info,..} if info.url == destination),
+    );
+    handle.shutdown();
+}
+
+#[test]
+fn una_imagen_lenta_no_retrasa_la_navegacion() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let server = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/", server.local_addr().unwrap());
+    let (finish_image, wait_for_snapshot) = std::sync::mpsc::channel();
+    let server_thread = std::thread::spawn(move || {
+        for stream in server.incoming() {
+            let mut stream = stream.unwrap();
+            let mut request = [0; 4096];
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let Ok(bytes) = stream.read(&mut request) else {
+                continue;
+            };
+            if bytes == 0 {
+                continue;
+            }
+            let path = String::from_utf8_lossy(&request[..bytes]);
+            if path.starts_with("GET /slow.png ") {
+                let _ = wait_for_snapshot.recv_timeout(Duration::from_secs(12));
+                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+                return;
+            }
+            let html =
+                "<title>Página lista</title><img src='/slow.png'><a href='#listo'>Continuar</a>";
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
+                html.len()
+            );
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let handle = spawn("about:blank".into(), dir.path().join("log"));
+    wait_for(&handle, 10, |event| matches!(event, Event::Snapshot { .. }));
+    handle.navigate(url);
+    wait_for(
+        &handle,
+        5,
+        |event| matches!(event, Event::Snapshot { info, .. } if info.title == "Página lista"),
+    );
+    finish_image.send(()).unwrap();
+    server_thread.join().unwrap();
     handle.shutdown();
 }
