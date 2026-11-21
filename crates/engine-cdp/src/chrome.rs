@@ -774,7 +774,9 @@ impl Chrome {
                 "Page.startScreencast",
                 json!({
                     "format": "jpeg",
-                    "quality": 92,
+                    // 30 fps basta para leer y desplazarse; a 60 el coste de
+                    // codificar y decodificar se dispara en páginas animadas.
+                    "quality": 80,
                     "everyNthFrame": 1,
                 }),
             )

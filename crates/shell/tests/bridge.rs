@@ -7,6 +7,29 @@ use std::time::{Duration, Instant};
 use session::ActOutcome;
 use shell::engine::{EngineHandle, Event, spawn};
 
+static TEST_SLOTS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+static TEST_SLOT_CV: std::sync::Condvar = std::sync::Condvar::new();
+
+fn slot() -> Slot {
+    const MAX: usize = 3;
+    let mut in_use = TEST_SLOTS.lock().unwrap();
+    while *in_use >= MAX {
+        in_use = TEST_SLOT_CV.wait(in_use).unwrap();
+    }
+    *in_use += 1;
+    Slot
+}
+
+struct Slot;
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut in_use = TEST_SLOTS.lock().unwrap();
+        *in_use -= 1;
+        TEST_SLOT_CV.notify_one();
+    }
+}
+
 fn wait_for(
     handle: &EngineHandle,
     seconds: u64,
@@ -50,6 +73,7 @@ fn first_snapshot(handle: &EngineHandle) -> (shell::engine::TabId, Vec<engine_cd
 
 #[test]
 fn la_pagina_se_ve_y_llega_el_snapshot() {
+    let _slot = slot();
     let server = navegador::FixtureServer::start();
     let dir = tempfile::tempdir().expect("tempdir");
     let handle = spawn(
@@ -74,6 +98,7 @@ fn la_pagina_se_ve_y_llega_el_snapshot() {
 
 #[test]
 fn click_sobre_un_boton_pasa_por_tarjeta_y_recibo() {
+    let _slot = slot();
     let server = navegador::FixtureServer::start();
     let dir = tempfile::tempdir().expect("tempdir");
     let handle = spawn(
@@ -150,6 +175,7 @@ fn click_sobre_un_boton_pasa_por_tarjeta_y_recibo() {
 
 #[test]
 fn atras_y_adelante_recorren_el_historial() {
+    let _slot = slot();
     let server = navegador::FixtureServer::start();
     let dir = tempfile::tempdir().expect("tempdir");
     let handle = spawn(
@@ -190,6 +216,7 @@ fn atras_y_adelante_recorren_el_historial() {
 
 #[test]
 fn las_pestanas_comparten_ventana_y_se_pueden_cerrar() {
+    let _slot = slot();
     let server = navegador::FixtureServer::start();
     let dir = tempfile::tempdir().expect("tempdir");
     let handle = spawn(
@@ -252,6 +279,7 @@ fn las_pestanas_comparten_ventana_y_se_pueden_cerrar() {
 
 #[test]
 fn seleccion_copia_y_enlace_con_pantalla_de_alta_densidad() {
+    let _slot = slot();
     let server = navegador::FixtureServer::start();
     let destination = server.page_url("shop.html");
     let url = format!(
@@ -292,6 +320,7 @@ fn seleccion_copia_y_enlace_con_pantalla_de_alta_densidad() {
 
 #[test]
 fn una_redireccion_tardia_actualiza_la_barra() {
+    let _slot = slot();
     let server = navegador::FixtureServer::start();
     let destination = server.page_url("shop.html");
     let initial = format!(
@@ -310,6 +339,7 @@ fn una_redireccion_tardia_actualiza_la_barra() {
 
 #[test]
 fn se_abre_un_enlace_que_aparece_despues_del_snapshot() {
+    let _slot = slot();
     let server = navegador::FixtureServer::start();
     let destination = server.page_url("shop.html");
     let initial = format!(
@@ -330,6 +360,7 @@ fn se_abre_un_enlace_que_aparece_despues_del_snapshot() {
 
 #[test]
 fn una_imagen_lenta_no_retrasa_la_navegacion() {
+    let _slot = slot();
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
@@ -381,6 +412,7 @@ fn una_imagen_lenta_no_retrasa_la_navegacion() {
 
 #[test]
 fn restaura_varias_pestanas_y_reutiliza_el_perfil_al_reabrir() {
+    let _slot = slot();
     let server = navegador::FixtureServer::start();
     let dir = tempfile::tempdir().expect("tempdir");
     let profile = dir.path().join("perfil");
@@ -427,6 +459,7 @@ fn restaura_varias_pestanas_y_reutiliza_el_perfil_al_reabrir() {
 
 #[test]
 fn enter_en_un_campo_pasa_por_la_tarjeta_y_no_escapa_solo() {
+    let _slot = slot();
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
@@ -547,6 +580,7 @@ fn enter_en_un_campo_pasa_por_la_tarjeta_y_no_escapa_solo() {
 
 #[test]
 fn un_perfil_ocupado_sigue_navegando_con_un_perfil_temporal() {
+    let _slot = slot();
     let server = navegador::FixtureServer::start();
     let dir = tempfile::tempdir().expect("tempdir");
     let profile = dir.path().join("perfil");
@@ -580,6 +614,7 @@ fn un_perfil_ocupado_sigue_navegando_con_un_perfil_temporal() {
 
 #[test]
 fn buscar_en_la_pagina_cuenta_y_recorre_las_coincidencias() {
+    let _slot = slot();
     let dir = tempfile::tempdir().expect("tempdir");
     let url = "data:text/html,<body><p>hola mundo</p><p>hola otra vez</p><p>adios</p></body>";
     let handle = spawn(url.to_string(), dir.path().join("log"));
@@ -610,6 +645,7 @@ fn buscar_en_la_pagina_cuenta_y_recorre_las_coincidencias() {
 
 #[test]
 fn una_descarga_llega_a_la_carpeta_y_avisa_al_terminar() {
+    let _slot = slot();
     use std::io::{Read, Write};
     use std::net::TcpListener;
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("puerto local");

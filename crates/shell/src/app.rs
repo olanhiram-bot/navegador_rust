@@ -68,6 +68,8 @@ pub struct ShellApp {
     /// Pide el foco para la página tras navegar: el teclado va a ella sin
     /// tener que hacer clic primero.
     focus_page: bool,
+    /// Estado de foco de la ventana, para no gastar CPU en segundo plano.
+    window_focused: Option<bool>,
     downloads: Vec<DownloadItem>,
     downloads_open: bool,
     bookmarks: Vec<crate::estado::Bookmark>,
@@ -157,6 +159,7 @@ impl ShellApp {
             selection_origin: None,
             last_viewport: (Vec2::ZERO, 0.0),
             focus_page: false,
+            window_focused: None,
             downloads: Vec::new(),
             downloads_open: false,
             bookmarks,
@@ -1581,6 +1584,21 @@ impl ShellApp {
 impl eframe::App for ShellApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_events(ui.ctx());
+        let focused = ui.ctx().input(|input| input.focused);
+        match (self.window_focused, focused) {
+            // Solo se pausa tras haber estado enfocada: al arrancar sin foco
+            // (Xvfb, un escritorio que tarda) la página debe seguir pintando.
+            (Some(true), false) => {
+                self.window_focused = Some(false);
+                self.handle.screencast(false);
+            }
+            (Some(false), true) => {
+                self.window_focused = Some(true);
+                self.handle.screencast(true);
+            }
+            (None, _) => self.window_focused = Some(focused),
+            _ => {}
+        }
         let shortcut = |key| ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, key));
         if shortcut(egui::Key::T) {
             self.handle.new_tab(None);

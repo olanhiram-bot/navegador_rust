@@ -136,6 +136,7 @@ pub enum Command {
         granted: Vec<String>,
         denied: Vec<String>,
     },
+    Screencast(bool),
     Shutdown,
 }
 
@@ -222,6 +223,11 @@ impl EngineHandle {
 
     pub fn handoff(&self) {
         let _ = self.commands.send(Command::Handoff);
+    }
+
+    /// Pausa o reanuda los frames de la pestaña activa (ventana sin foco).
+    pub fn screencast(&self, running: bool) {
+        let _ = self.commands.send(Command::Screencast(running));
     }
 
     /// Fija los permisos de un origen en todas sus pestañas.
@@ -547,6 +553,15 @@ async fn handle_command(state: &mut State, command: Command, events: &Emitter) -
                     .session
                     .set_permissions(&origin, &granted, &denied)
                     .await?;
+            }
+        }
+        Command::Screencast(running) => {
+            if let Some(tab) = active_tab(state) {
+                if running {
+                    tab.session.start_screencast().await.ok();
+                } else {
+                    tab.session.stop_screencast().await.ok();
+                }
             }
         }
         Command::Approve { hash } => approve(state, &hash, events).await?,

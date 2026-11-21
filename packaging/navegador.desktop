@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Navegador
+Comment=Navegador auditable: la persona y el agente comparten la misma pestaña
+Exec=navegador-shell %u
+Terminal=false
+Categories=Network;WebBrowser;
+MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;
+StartupNotify=true

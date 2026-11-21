@@ -3,6 +3,7 @@
 //!
 //! ```text
 //! navegador-shell [URL] [--log RUTA] [--perfil DIR] [--efimero] [--sin-restaurar]
+//! navegador-shell --version
 //! ```
 //!
 //! Por defecto usa un perfil persistente y restaura las pestañas de la última
@@ -15,6 +16,10 @@ use shell::app::ShellApp;
 use shell::engine::Options;
 
 fn main() -> eframe::Result<()> {
+    if std::env::args().any(|arg| arg == "--version" || arg == "-V") {
+        println!("navegador-shell {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let mut url: Option<String> = None;
     let mut log_path = PathBuf::from("navegador-recibos.jsonl");
     let mut profile = shell::estado::data_dir().map(|dir| dir.join("perfil"));

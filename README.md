@@ -18,6 +18,18 @@ agente con generación, refs y handoff. Todas las pestañas comparten un único
 Chromium, con perfil persistente y restauración de la sesión. Falta el demo de
 60 s grabado.
 
+## Instalación
+
+```bash
+packaging/install.sh              # binario en ~/.local/bin y entrada de escritorio
+packaging/install.sh /otro/prefijo
+navegador-shell --version
+```
+
+El instalador compila con `--locked`; para actualizar, vuelve a ejecutarlo. No
+toca archivos del sistema y usa el Chromium instalado, que recibe sus parches
+con el sistema.
+
 ## Cómo correrlo
 
 ```bash
