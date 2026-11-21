@@ -378,3 +378,48 @@ fn una_imagen_lenta_no_retrasa_la_navegacion() {
     server_thread.join().unwrap();
     handle.shutdown();
 }
+
+#[test]
+fn restaura_varias_pestanas_y_reutiliza_el_perfil_al_reabrir() {
+    let server = navegador::FixtureServer::start();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let profile = dir.path().join("perfil");
+    let open = |urls: Vec<String>| {
+        shell::engine::spawn_with_options(
+            shell::engine::Options {
+                initial_urls: urls,
+                log_path: dir.path().join("recibos.jsonl"),
+                profile: Some(profile.clone()),
+            },
+            std::sync::Arc::new(|| {}),
+        )
+    };
+
+    let handle = open(vec![
+        server.page_url("shop.html"),
+        server.page_url("settings.html"),
+    ]);
+    let mut opened = Vec::new();
+    while opened.len() < 2 {
+        if let Event::TabOpened(info) =
+            wait_for(&handle, 30, |event| matches!(event, Event::TabOpened(_)))
+        {
+            opened.push(info.url);
+        }
+    }
+    assert_eq!(
+        opened.len(),
+        2,
+        "deben abrirse las dos pestañas restauradas"
+    );
+    handle.shutdown();
+    assert!(
+        profile.is_dir(),
+        "el perfil persistente debe sobrevivir al cierre: {profile:?}"
+    );
+
+    // El candado se suelta al cerrar: reabrir el mismo perfil debe funcionar.
+    let handle = open(vec![server.page_url("shop.html")]);
+    first_snapshot(&handle);
+    handle.shutdown();
+}

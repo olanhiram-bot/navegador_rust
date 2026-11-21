@@ -6,5 +6,5 @@
 mod cdp;
 mod chrome;
 
-pub use chrome::Chrome;
+pub use chrome::{Browser, Chrome, Page, Profile};
 pub use engine::{DispatchOutcome, ElementRef, Engine, Snapshot};

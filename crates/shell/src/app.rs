@@ -56,10 +56,17 @@ pub struct ShellApp {
     generation: u32,
     selection_origin: Option<egui::Pos2>,
     last_viewport: (Vec2, f32),
+    /// Dónde se guarda la sesión; `None` con perfil efímero.
+    session_path: Option<PathBuf>,
+    saved_session: Option<crate::estado::SessionState>,
 }
 
 impl ShellApp {
-    pub fn new(initial_url: String, log_path: PathBuf, cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(
+        options: crate::engine::Options,
+        session_path: Option<PathBuf>,
+        cc: &eframe::CreationContext<'_>,
+    ) -> Self {
         let ctx = &cc.egui_ctx;
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = CHROME;
@@ -73,16 +80,20 @@ impl ShellApp {
         style.spacing.button_padding = egui::vec2(9.0, 4.0);
         ctx.set_style_of(egui::Theme::Dark, style);
 
+        let first = options
+            .initial_urls
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "about:blank".to_string());
         let repaint_ctx = ctx.clone();
         ShellApp {
-            handle: crate::engine::spawn_with_notify(
-                initial_url.clone(),
-                log_path,
+            handle: crate::engine::spawn_with_options(
+                options,
                 Arc::new(move || repaint_ctx.request_repaint()),
             ),
             tabs: Vec::new(),
             active: None,
-            address: initial_url,
+            address: first,
             status: "cargando…".to_string(),
             frames: HashMap::new(),
             pending: None,
@@ -95,7 +106,52 @@ impl ShellApp {
             generation: 0,
             selection_origin: None,
             last_viewport: (Vec2::ZERO, 0.0),
+            session_path,
+            saved_session: None,
         }
+    }
+
+    /// Guarda las pestañas abiertas si cambiaron desde el último guardado.
+    fn persist_session(&mut self) {
+        let Some(path) = &self.session_path else {
+            return;
+        };
+        // Una pestaña recién abierta aún no tiene URL útil; guardar ahora la
+        // quitaría de la sesión y no volvería tras reiniciar.
+        if self
+            .tabs
+            .iter()
+            .any(|tab| !crate::estado::is_restorable(&tab.url))
+        {
+            return;
+        }
+        let tabs: Vec<crate::estado::TabState> = self
+            .tabs
+            .iter()
+            .filter(|tab| crate::estado::is_restorable(&tab.url))
+            .map(|tab| crate::estado::TabState {
+                url: tab.url.clone(),
+                title: tab.title.clone(),
+            })
+            .collect();
+        let active = self
+            .active
+            .and_then(|id| self.tabs.iter().position(|tab| tab.id == id))
+            .unwrap_or(0);
+        let state = crate::estado::SessionState { tabs, active };
+        if self.saved_session.as_ref() == Some(&state) {
+            return;
+        }
+        if state.tabs.is_empty() {
+            // Cerrar la última pestaña no borra la sesión: al reabrir, la
+            // ventana vuelve a la página inicial en lugar de quedar vacía.
+            return;
+        }
+        if let Err(error) = crate::estado::save(path, &state) {
+            self.status = format!("no se pudo guardar la sesión: {error}");
+            return;
+        }
+        self.saved_session = Some(state);
     }
 
     fn drain_events(&mut self, ctx: &egui::Context) {
@@ -234,6 +290,7 @@ impl ShellApp {
         if let Some((tab, frame)) = latest_frame {
             self.apply_frame(ctx, tab, frame);
         }
+        self.persist_session();
     }
 
     fn apply_frame(&mut self, ctx: &egui::Context, tab: TabId, frame: crate::engine::Frame) {
@@ -927,6 +984,9 @@ impl eframe::App for ShellApp {
         }
         if shortcut(egui::Key::R) {
             self.handle.reload();
+        }
+        if shortcut(egui::Key::Q) {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
         egui::Panel::top("chrome")

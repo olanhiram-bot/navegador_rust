@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
-use engine_cdp::{Chrome, ElementRef};
+use engine_cdp::{Browser, Chrome, ElementRef, Profile};
 use receipt::{Identity, ReceiptLog};
 use serde_json::Value;
 use session::{ActOptions, ActOutcome, Handoff, Session, SessionConfig};
@@ -240,6 +240,14 @@ pub fn spawn(initial_url: String, log_path: PathBuf) -> EngineHandle {
     spawn_with_notify(initial_url, log_path, Arc::new(|| {}))
 }
 
+/// Arranque del motor con perfil persistente o efímero y varias pestañas.
+pub struct Options {
+    pub initial_urls: Vec<String>,
+    pub log_path: PathBuf,
+    /// `None` deja el perfil efímero (se borra al cerrar).
+    pub profile: Option<PathBuf>,
+}
+
 /// `notify` despierta a la UI cuando hay un evento nuevo: sin él habría que
 /// repintar a ciegas y se gastaba CPU con la página quieta.
 pub fn spawn_with_notify(
@@ -247,6 +255,17 @@ pub fn spawn_with_notify(
     log_path: PathBuf,
     notify: Arc<dyn Fn() + Send + Sync>,
 ) -> EngineHandle {
+    spawn_with_options(
+        Options {
+            initial_urls: vec![initial_url],
+            log_path,
+            profile: None,
+        },
+        notify,
+    )
+}
+
+pub fn spawn_with_options(options: Options, notify: Arc<dyn Fn() + Send + Sync>) -> EngineHandle {
     let (commands, command_rx) = unbounded_channel();
     let (events_tx, events) = channel();
     let (done_tx, done) = channel();
@@ -256,7 +275,7 @@ pub fn spawn_with_notify(
     };
 
     std::thread::spawn(move || {
-        if let Err(error) = run(initial_url, log_path, command_rx, emitter.clone()) {
+        if let Err(error) = run(options, command_rx, emitter.clone()) {
             emitter.emit(Event::Error(format!("{error:#}")));
         }
         let _ = done_tx.send(());
@@ -279,6 +298,8 @@ struct Tab {
     session: Session<Chrome>,
     log_path: PathBuf,
     pending: Option<Pending>,
+    /// Target CDP de la pestaña: sirve para cerrarla y traerla al frente.
+    page_id: String,
 }
 
 struct State {
@@ -286,14 +307,11 @@ struct State {
     active: Option<TabId>,
     next_id: TabId,
     log_base: PathBuf,
+    browser: Option<Arc<Browser>>,
+    profile: Option<PathBuf>,
 }
 
-fn run(
-    initial_url: String,
-    log_path: PathBuf,
-    mut commands: UnboundedReceiver<Command>,
-    events: Emitter,
-) -> Result<()> {
+fn run(options: Options, mut commands: UnboundedReceiver<Command>, events: Emitter) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -306,11 +324,15 @@ fn run(
             tabs: BTreeMap::new(),
             active: None,
             next_id: 0,
-            log_base: log_path,
+            log_base: options.log_path,
+            browser: None,
+            profile: options.profile,
         };
 
-        if let Err(error) = open_tab(&mut state, &initial_url, &events).await {
-            events.emit(Event::Error(format!("{error:#}")));
+        for url in &options.initial_urls {
+            if let Err(error) = open_tab(&mut state, url, &events).await {
+                events.emit(Event::Error(format!("{error:#}")));
+            }
         }
 
         loop {
@@ -384,7 +406,11 @@ async fn handle_browser_event(
 /// `true` significa cerrar la shell.
 async fn handle_command(state: &mut State, command: Command, events: &Emitter) -> Result<bool> {
     match command {
-        Command::Shutdown => return Ok(true),
+        Command::Shutdown => {
+            state.tabs.clear();
+            state.browser = None;
+            return Ok(true);
+        }
         Command::NewTab { url } => {
             open_tab(state, url.as_deref().unwrap_or("about:blank"), events).await?;
         }
@@ -460,9 +486,11 @@ async fn open_tab(state: &mut State, url: &str, events: &Emitter) -> Result<TabI
     let log_path = tab_log_path(&state.log_base, id);
     let log =
         ReceiptLog::open(&log_path).with_context(|| format!("abrir el log de la pestaña {id}"))?;
-    let chrome = Chrome::launch_for_shell()
+    let browser = shared_browser(state).await?;
+    let chrome = Chrome::attach_for_shell(browser)
         .await
-        .context("lanzar Chromium")?;
+        .context("abrir una pestaña en Chromium")?;
+    let page_id = chrome.page_id().to_string();
     let mut session = Session::new(
         chrome,
         Identity::generate().context("generar la identidad local")?,
@@ -492,6 +520,7 @@ async fn open_tab(state: &mut State, url: &str, events: &Emitter) -> Result<TabI
             session,
             log_path,
             pending: None,
+            page_id,
         },
     );
 
@@ -506,9 +535,30 @@ async fn open_tab(state: &mut State, url: &str, events: &Emitter) -> Result<TabI
     Ok(id)
 }
 
+/// Un solo Chromium por sesión: así las pestañas comparten cookies y perfil.
+async fn shared_browser(state: &mut State) -> Result<Arc<Browser>> {
+    if let Some(browser) = &state.browser {
+        return Ok(browser.clone());
+    }
+    let profile = match &state.profile {
+        Some(path) => Profile::persistent(path.clone()),
+        None => Profile::ephemeral()?,
+    };
+    let browser = Arc::new(
+        Browser::launch(profile, true)
+            .await
+            .context("lanzar Chromium")?,
+    );
+    state.browser = Some(browser.clone());
+    Ok(browser)
+}
+
 async fn close_tab(state: &mut State, id: TabId, events: &Emitter) -> Result<()> {
-    if state.tabs.remove(&id).is_none() {
+    let Some(tab) = state.tabs.remove(&id) else {
         return Ok(());
+    };
+    if let Some(browser) = &state.browser {
+        browser.close_page(&tab.page_id).await.ok();
     }
     let _ = events.emit(Event::TabClosed(id));
     if state.active != Some(id) {
@@ -535,6 +585,13 @@ async fn select_tab(state: &mut State, id: TabId, events: &Emitter) -> Result<()
         && let Some(tab) = state.tabs.get_mut(&old)
     {
         tab.session.stop_screencast().await.ok();
+    }
+    if let Some(browser) = &state.browser
+        && let Some(tab) = state.tabs.get(&id)
+    {
+        // Chromium no dibuja la pestaña de fondo: sin activarla, el screencast
+        // se queda con el último frame.
+        browser.activate_page(&tab.page_id).await.ok();
     }
 
     let (info, elements) = {

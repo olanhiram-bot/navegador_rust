@@ -18,6 +18,7 @@ eframe.workspace = true
 engine-cdp = { path = "../engine-cdp" }
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 receipt = { path = "../receipt" }
+serde = { workspace = true }
 serde_json.workspace = true
 session = { path = "../session" }
 tokio = { workspace = true, features = ["sync"] }

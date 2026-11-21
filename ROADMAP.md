@@ -5,9 +5,9 @@ El primer objetivo es que el navegador sea una opción diaria en Linux. Una vez 
 ## 1. Fluidez y compatibilidad
 
 - [ ] **Medir una línea base frente a Firefox y Brave.** Usar la misma máquina, escala, resolución y una versión optimizada del proyecto. Registrar versiones, distinguir caché fría de caliente y ejecutar al menos cinco repeticiones por recorrido. Medir tiempo al primer contenido, latencia del clic al primer cambio visible, tirones al desplazar y memoria del árbol de procesos con una y diez pestañas. Usar YouTube, un documento de prueba y una web de noticias. Repetir el recorrido con una página local para separar la demora de la aplicación de la red.
-- [ ] **Probar una vista integrada de Chromium.** Compararla con la vista actual por JPEG. Verificar clic, arrastre, selección, portapapeles, teclado, DPI, video con audio y navegación dentro de una misma página. Adoptarla cuando mejore la latencia visible y permita seguir verificando las acciones del agente.
+- [x] **Probar una vista integrada de Chromium.** Compararla con la vista actual por JPEG. Verificar clic, arrastre, selección, portapapeles, teclado, DPI, video con audio y navegación dentro de una misma página. Adoptarla cuando mejore la latencia visible y permita seguir verificando las acciones del agente. Resultado: [la vista de Qt WebEngine recibe el clic real y el agente sigue pudiendo verificar y cancelar el POST](docs/investigacion/vista-integrada-qt-2026-11-20.md), pero bajo Xvfb presenta la superficie nueva ~550 ms después del clic, frente a 74 ms de la vista por JPEG. No se adopta todavía; falta medirla en un escritorio con compositor.
 - [ ] **Convertir los recorridos básicos en pruebas de regresión.** Cubrir búsqueda, apertura de videos, redirecciones, formularios, historial y recuperación tras un error. Usar fixtures para la ejecución habitual y recorridos públicos de solo lectura para verificar compatibilidad.
-- [ ] **Medir y reducir el costo de las pestañas.** Registrar RAM y CPU en reposo y bajo carga. Evaluar reutilizar el proceso de navegador entre pestañas con aislamiento por perfil y suspender trabajo en segundo plano.
+- [ ] **Medir y reducir el costo de las pestañas.** Registrar RAM y CPU en reposo y bajo carga. Evaluar reutilizar el proceso de navegador entre pestañas con aislamiento por perfil y suspender trabajo en segundo plano. Desde 2026-11-20 todas las pestañas comparten un solo proceso y un solo perfil; falta la medición de RAM y CPU.
 
 [Speedometer 3.1](https://browserbench.org/Speedometer3.1/about.html) complementa las mediciones de la ventana.
 
@@ -21,12 +21,25 @@ Se ejecutaron cinco rondas alternando el orden de los navegadores en Linux x86_6
 | Brave 158.1.100.58 | 917 ms | 95 ms |
 | Firefox 158.0.1 | 2880 ms | 146 ms |
 
-Esta medición inicial cubre un enlace local y la ventana gráfica. Quedan por medir la compilación optimizada, los sitios públicos, el desplazamiento, el video y el costo de varias pestañas. El arranque de un perfil nuevo incluye el trabajo de inicializar ese perfil.
+Esta medición inicial cubre un enlace local y la ventana gráfica. Quedan por medir los sitios públicos, el desplazamiento, el video y la memoria con varias pestañas. El arranque de un perfil nuevo incluye el trabajo de inicializar ese perfil.
+
+### Segunda medición local (optimizada)
+
+Se repitió el mismo recorrido con el proyecto en `--release`, un solo proceso Chromium para la sesión y la vista integrada de Qt como candidata. La carga de la máquina no fue idéntica a la primera medición, así que los valores absolutos solo se comparan dentro de esta tabla.
+
+| Navegador | Primer contenido, mediana | Clic a cambio visible, mediana |
+|---|---:|---:|
+| Proyecto en release, un Chromium por sesión | 393 ms | 74 ms |
+| Qt WebEngine integrado | 493 ms | 549 ms |
+| Brave 158.1.100.58 | 340 ms | 45 ms |
+| Firefox 158.0.1 | 908 ms | 62 ms |
+
+En la compilación optimizada, el clic tarda casi la mitad que en la medición inicial con `dev`. El detalle de la vista integrada, incluida la verificación del POST por CDP, está en [la nota de la prueba](docs/investigacion/vista-integrada-qt-2026-11-20.md).
 
 ## 2. Uso diario y seguridad
 
 - [x] **Arrancar Chromium con el sandbox habilitado.** La prueba en Linux confirma el aislamiento mediante `chrome://sandbox/`. Si Chromium termina antes de abrir el puerto de control, el motor informa qué ejecutable falló y su código de salida.
-- [ ] **Perfiles persistentes y recuperación de sesión.** Restaurar pestañas e inicios de sesión tras reiniciar. Mantener una opción de perfil efímero y demostrar que sus cookies se eliminan al cerrar.
+- [x] **Perfiles persistentes y recuperación de sesión.** La shell usa `~/.local/share/navegador/perfil` y comparte un único Chromium entre pestañas, así que las cookies se comparten y los inicios de sesión sobreviven al reinicio. Al arrancar sin URL restaura las pestañas de la última sesión (`~/.local/state/navegador/sesion.json`). `--efimero` desactiva perfil, restauración y guardado, y borra el perfil al cerrar; `--perfil DIR` y `--sin-restaurar` ajustan el comportamiento. Un candado sobre el perfil avisa si otra ventana ya lo está usando. Las pruebas cubren cookies compartidas entre pestañas, cookies que sobreviven al reinicio y el borrado del perfil efímero.
 - [ ] **Descargas y permisos por sitio.** Mostrar progreso, cancelación y destino de las descargas. Permitir revisar y revocar permisos de cámara, micrófono, ubicación y notificaciones.
 - [ ] **Funciones de escritorio.** Añadir marcadores, historial, zoom por sitio, búsqueda dentro de página y accesibilidad por teclado. Revisar ventanas estrechas y escalas de pantalla distintas.
 - [ ] **Distribución y actualizaciones.** Probar instalación, actualización del ejecutable y compatibilidad con versiones de Chromium que reciben parches.

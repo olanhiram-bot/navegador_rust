@@ -2,17 +2,23 @@
 //! handoff al agente.
 //!
 //! ```text
-//! navegador-shell [URL] [--log RUTA]
+//! navegador-shell [URL] [--log RUTA] [--perfil DIR] [--efimero] [--sin-restaurar]
 //! ```
+//!
+//! Por defecto usa un perfil persistente y restaura las pestañas de la última
+//! sesión. `--efimero` arranca sin perfil guardado ni restauración.
 
 use std::path::PathBuf;
 
 use eframe::egui;
 use shell::app::ShellApp;
+use shell::engine::Options;
 
 fn main() -> eframe::Result<()> {
-    let mut url = "about:blank".to_string();
+    let mut url: Option<String> = None;
     let mut log_path = PathBuf::from("navegador-recibos.jsonl");
+    let mut profile = shell::estado::data_dir().map(|dir| dir.join("perfil"));
+    let mut restore = true;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -23,11 +29,41 @@ fn main() -> eframe::Result<()> {
                     std::process::exit(2);
                 }));
             }
-            other => url = shell::app::browser_url(other),
+            "--perfil" => {
+                profile = Some(PathBuf::from(args.next().unwrap_or_else(|| {
+                    eprintln!("--perfil necesita un directorio");
+                    std::process::exit(2);
+                })));
+            }
+            "--efimero" => {
+                profile = None;
+                restore = false;
+            }
+            "--sin-restaurar" => restore = false,
+            other => url = Some(shell::app::browser_url(other)),
         }
     }
 
-    let options = eframe::NativeOptions {
+    let session_path = if restore && profile.is_some() {
+        shell::estado::session_path()
+    } else {
+        None
+    };
+    let initial_urls = match url {
+        Some(url) => vec![url],
+        None => session_path
+            .as_deref()
+            .and_then(shell::estado::load)
+            .map(|state| state.ordered_urls())
+            .unwrap_or_else(|| vec!["about:blank".to_string()]),
+    };
+
+    let options = Options {
+        initial_urls,
+        log_path,
+        profile,
+    };
+    let options_eframe = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 780.0])
             .with_title("Navegador"),
@@ -36,7 +72,7 @@ fn main() -> eframe::Result<()> {
 
     eframe::run_native(
         "Navegador",
-        options,
-        Box::new(move |cc| Ok(Box::new(ShellApp::new(url, log_path, cc)))),
+        options_eframe,
+        Box::new(move |cc| Ok(Box::new(ShellApp::new(options, session_path, cc)))),
     )
 }

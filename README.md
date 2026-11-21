@@ -14,7 +14,9 @@ bloqueos; falta validarlos en sitios reales. La fase 5 ya tiene una **shell
 mínima**: pestañas, página visible por screencast CDP, barra de dirección con
 búsqueda, scroll, navegación por enlaces, campos de texto con teclado,
 atrás/adelante, acciones sobre botones con tarjeta modal y recibo, y panel del
-agente con generación, refs y handoff. Falta el demo de 60 s grabado.
+agente con generación, refs y handoff. Todas las pestañas comparten un único
+Chromium, con perfil persistente y restauración de la sesión. Falta el demo de
+60 s grabado.
 
 ## Cómo correrlo
 
@@ -23,6 +25,13 @@ cargo test --workspace --all-targets   # unitarios, arnés de ataques y gate MCP
 
 # shell mínima: página visible, barra de dirección y handoff
 cargo run -p shell -- https://ejemplo.com --log /tmp/recibos.jsonl
+
+# perfil persistente y restauración de pestañas (por defecto)
+#   perfil:   ~/.local/share/navegador/perfil
+#   sesión:   ~/.local/state/navegador/sesion.json
+# --efimero no guarda nada y borra el perfil al cerrar; --perfil DIR elige otro
+# directorio; --sin-restaurar abre una pestaña en lugar de las de la última vez.
+cargo run -p shell -- --efimero https://ejemplo.com
 
 # recomendado para sitios con captcha (Chromium headful en display virtual)
 # Arch: sudo pacman -S xorg-server-xvfb

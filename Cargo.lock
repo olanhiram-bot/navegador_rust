@@ -2496,6 +2496,7 @@ dependencies = [
  "image",
  "navegador",
  "receipt",
+ "serde",
  "serde_json",
  "session",
  "tempfile",

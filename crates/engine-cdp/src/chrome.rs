@@ -2,6 +2,7 @@
 //! descriptor y despachar una acción verificada.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -19,28 +20,94 @@ const SNAPSHOT_JS: &str = include_str!("snapshot.js");
 const ELEMENT_NAME_JS: &str = include_str!("element-name.js");
 const HIT_JS: &str = include_str!("hit.js");
 
-/// Chromium headless controlado por CDP.
-pub struct Chrome {
+/// Perfil de Chromium: efímero (directorio temporal que se borra al cerrar) o
+/// persistente (conserva cookies e inicios de sesión entre arranques).
+pub enum Profile {
+    Ephemeral(tempfile::TempDir),
+    Persistent(PathBuf),
+}
+
+impl Profile {
+    pub fn ephemeral() -> Result<Self> {
+        Ok(Self::Ephemeral(
+            tempfile::tempdir().context("no se pudo crear el perfil temporal")?,
+        ))
+    }
+
+    pub fn persistent(path: impl Into<PathBuf>) -> Self {
+        Self::Persistent(path.into())
+    }
+
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Ephemeral(dir) => dir.path(),
+            Self::Persistent(path) => path,
+        }
+    }
+
+    pub fn is_ephemeral(&self) -> bool {
+        matches!(self, Self::Ephemeral(_))
+    }
+}
+
+impl std::fmt::Debug for Profile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Profile")
+            .field("path", &self.path())
+            .field("ephemeral", &self.is_ephemeral())
+            .finish()
+    }
+}
+
+/// Un `target` de tipo página dentro del navegador compartido.
+#[derive(Debug, Clone)]
+pub struct Page {
+    id: String,
+    ws: String,
+}
+
+impl Page {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn ws(&self) -> &str {
+        &self.ws
+    }
+}
+
+/// Proceso Chromium que comparten todas las pestañas de una sesión.
+///
+/// Un solo proceso (y un solo perfil) significa cookies compartidas entre
+/// pestañas, menos RAM y la posibilidad de reutilizar un perfil persistente.
+pub struct Browser {
     child: Child,
-    _profile: tempfile::TempDir,
+    profile: Profile,
+    /// Candado exclusivo del perfil persistente: dos instancias con el mismo
+    /// `--user-data-dir` no pueden coexistir.
+    _lock: Option<std::fs::File>,
     /// Display virtual para el modo headful. Sin él, Chromium corre headless y
     /// los captchas lo identifican como bot.
     _display: Option<VirtualDisplay>,
     port: u16,
-    cdp: Cdp,
-    fetch_armed: bool,
-    interactive_navigation: bool,
 }
 
-impl Chrome {
-    pub async fn launch() -> Result<Self> {
-        Self::launch_with_audio(false).await
-    }
-
-    pub async fn launch_with_audio(audio: bool) -> Result<Self> {
+impl Browser {
+    pub async fn launch(profile: Profile, audio: bool) -> Result<Self> {
         let binary = find_binary()?;
-        let profile = tempfile::tempdir().context("no se pudo crear el perfil temporal")?;
         let profile_path = profile.path().to_path_buf();
+        if let Profile::Persistent(path) = &profile {
+            std::fs::create_dir_all(path)
+                .with_context(|| format!("no se pudo crear {}", path.display()))?;
+        }
+        let lock = if profile.is_ephemeral() {
+            None
+        } else {
+            Some(lock_profile(&profile_path)?)
+        };
+        // Un DevToolsActivePort de una ejecución anterior apuntaría a un puerto
+        // muerto o, peor, al de otro programa.
+        let _ = std::fs::remove_file(profile_path.join("DevToolsActivePort"));
 
         // Con Xvfb disponible, Chromium corre headful dentro de un display
         // virtual: los sitios ven un navegador normal. Sin Xvfb se mantiene el
@@ -97,43 +164,188 @@ impl Chrome {
         #[cfg(unix)]
         command.process_group(0);
 
+        // Si la shell muere de golpe (SIGKILL, SIGTERM sin destructores), el
+        // navegador no debe quedarse vivo con el perfil bloqueado.
+        #[cfg(unix)]
+        unsafe {
+            command.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                Ok(())
+            });
+        }
+
         let mut child = command
             .spawn()
             .with_context(|| format!("no se pudo lanzar {}", binary.display()))?;
         let port =
             wait_for_port(&mut child, &binary, &profile_path, Duration::from_secs(20)).await?;
-        let page_ws = page_target_ws(port).await?;
-        let cdp = Cdp::connect(&page_ws).await?;
 
-        Ok(Chrome {
+        Ok(Browser {
             child,
-            _profile: profile,
+            profile,
+            _lock: lock,
             _display: display,
             port,
-            cdp,
-            fetch_armed: false,
-            interactive_navigation: false,
         })
-    }
-
-    pub async fn launch_for_shell() -> Result<Self> {
-        let mut chrome = Self::launch_with_audio(true).await?;
-        chrome.interactive_navigation = true;
-        Ok(chrome)
     }
 
     pub fn port(&self) -> u16 {
         self.port
     }
 
-    /// Perfil efímero de esta instancia. Vive en un directorio temporal y se
-    /// borra al dropear el motor.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
+    pub fn profile_dir(&self) -> &Path {
+        self.profile.path()
+    }
+
+    /// Abre una pestaña nueva dentro de este proceso.
+    pub async fn new_page(&self) -> Result<Page> {
+        let body = http_request(self.port, "PUT", "/json/new?url=about:blank").await?;
+        let target: Value = serde_json::from_str(&body).context("/json/new no es JSON")?;
+        let id = target
+            .get("id")
+            .and_then(Value::as_str)
+            .context("el target nuevo no trae id")?
+            .to_string();
+        let ws = target
+            .get("webSocketDebuggerUrl")
+            .and_then(Value::as_str)
+            .context("el target nuevo no trae WebSocket")?
+            .to_string();
+        // Con un perfil persistente, Chromium puede restaurar pestañas de la
+        // ejecución anterior y dejar la recién creada en segundo plano; una
+        // pestaña de fondo no dibuja, así que el screencast se quedaría mudo.
+        let _ = self.activate_page(&id).await;
+        Ok(Page { id, ws })
+    }
+
+    /// Trae al frente la pestaña indicada. Chromium no dibuja una pestaña de
+    /// fondo, así que su screencast se quedaría congelado.
+    pub async fn activate_page(&self, id: &str) -> Result<()> {
+        http_request(self.port, "GET", &format!("/json/activate/{id}")).await?;
+        Ok(())
+    }
+
+    pub async fn close_page(&self, id: &str) -> Result<()> {
+        http_request(self.port, "GET", &format!("/json/close/{id}")).await?;
+        Ok(())
+    }
+
+    /// Cierre ordenado: Chromium vuelca cookies e historial al perfil, igual
+    /// que al cerrar una ventana.
+    pub async fn close(&self) -> Result<()> {
+        let version = http_request(self.port, "GET", "/json/version").await?;
+        let version: Value = serde_json::from_str(&version).context("/json/version no es JSON")?;
+        let ws = version
+            .get("webSocketDebuggerUrl")
+            .and_then(Value::as_str)
+            .context("/json/version sin WebSocket")?;
+        let cdp = Cdp::connect(ws).await?;
+        cdp.call("Browser.close", json!({})).await.ok();
+        Ok(())
+    }
+
+    fn wait_exit(&mut self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+}
+
+impl Drop for Browser {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.child.id() {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            // SIGTERM primero: Chromium alcanza a volcar cookies e historial al
+            // perfil. Si no termina, el grupo entero cae con SIGKILL.
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
+            self.wait_exit(Duration::from_secs(10));
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+        }
+        let _ = self.child.start_kill();
+    }
+}
+
+/// Chromium headless controlado por CDP.
+pub struct Chrome {
+    browser: Arc<Browser>,
+    page: Page,
+    cdp: Cdp,
+    fetch_armed: bool,
+    interactive_navigation: bool,
+}
+
+impl Chrome {
+    pub async fn launch() -> Result<Self> {
+        Self::launch_with_audio(false).await
+    }
+
+    pub async fn launch_with_audio(audio: bool) -> Result<Self> {
+        let browser = Arc::new(Browser::launch(Profile::ephemeral()?, audio).await?);
+        Self::attach(browser).await
+    }
+
+    /// Conecta una pestaña nueva al navegador compartido.
+    pub async fn attach(browser: Arc<Browser>) -> Result<Self> {
+        let page = browser.new_page().await?;
+        let cdp = Cdp::connect(page.ws()).await?;
+        Ok(Chrome {
+            browser,
+            page,
+            cdp,
+            fetch_armed: false,
+            interactive_navigation: false,
+        })
+    }
+
+    pub async fn launch_for_shell(profile: Profile) -> Result<Self> {
+        let browser = Arc::new(Browser::launch(profile, true).await?);
+        Self::attach_for_shell(browser).await
+    }
+
+    /// Pestaña interactiva (navegación del usuario) dentro de un navegador ya
+    /// lanzado.
+    pub async fn attach_for_shell(browser: Arc<Browser>) -> Result<Self> {
+        let mut chrome = Self::attach(browser).await?;
+        chrome.interactive_navigation = true;
+        Ok(chrome)
+    }
+
+    pub fn port(&self) -> u16 {
+        self.browser.port()
+    }
+
+    /// Directorio del perfil en uso.
     pub fn profile_dir(&self) -> &std::path::Path {
-        self._profile.path()
+        self.browser.profile_dir()
+    }
+
+    /// Proceso Chromium que aloja esta pestaña.
+    pub fn browser(&self) -> &Arc<Browser> {
+        &self.browser
+    }
+
+    /// Identificador del target de esta pestaña.
+    pub fn page_id(&self) -> &str {
+        self.page.id()
     }
 
     pub fn pid(&self) -> Option<u32> {
-        self.child.id()
+        self.browser.pid()
     }
 
     pub async fn navigate(&mut self, url: &str) -> Result<()> {
@@ -856,19 +1068,8 @@ impl engine::Transport for Chrome {
     }
 }
 
-impl Drop for Chrome {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        if let Some(pid) = self.child.id() {
-            // El hijo es líder de su propio grupo: así caen también zygotes y
-            // renderers, que de otro modo quedan huérfanos.
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGKILL);
-            }
-        }
-        let _ = self.child.start_kill();
-    }
-}
+// La pestaña no mata al navegador: lo cierra `Browser::drop` cuando ya no queda
+// ninguna pestaña que lo use.
 
 /// Display X virtual para correr Chromium headful sin abrir una ventana en el
 /// escritorio. Se usa solo si `Xvfb` está instalado y no se pidió headless.
@@ -879,19 +1080,31 @@ struct VirtualDisplay {
 
 impl VirtualDisplay {
     async fn start() -> Result<Self> {
+        // Varias pruebas piden display a la vez: sin este turno, dos podrían
+        // elegir el mismo :99 y una acabaría en un X roto.
+        let _turn = display_turn().lock().await;
         let binary = find_in_path("Xvfb").context("Xvfb no está en PATH")?;
         for n in 99..=110 {
             if Path::new(&format!("/tmp/.X{n}-lock")).exists() {
                 continue;
             }
             let display = format!(":{n}");
-            let mut child = Command::new(&binary)
+            let mut command = Command::new(&binary);
+            command
                 .arg(&display)
                 .args(["-screen", "0", "1920x1200x24", "-nolisten", "tcp", "-ac"])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
-                .kill_on_drop(true)
+                .kill_on_drop(true);
+            #[cfg(unix)]
+            unsafe {
+                command.pre_exec(|| {
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                    Ok(())
+                });
+            }
+            let mut child = command
                 .spawn()
                 .with_context(|| format!("lanzar Xvfb en {display}"))?;
 
@@ -913,8 +1126,28 @@ impl VirtualDisplay {
     }
 }
 
+fn display_turn() -> &'static tokio::sync::Mutex<()> {
+    static TURN: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    TURN.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 impl Drop for VirtualDisplay {
     fn drop(&mut self) {
+        // SIGTERM deja que Xvfb borre su candado de /tmp; con SIGKILL quedaban
+        // displays fantasma que agotaban el rango :99-:110.
+        #[cfg(unix)]
+        if let Some(pid) = self.child.id() {
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                match self.child.try_wait() {
+                    Ok(Some(_)) | Err(_) => break,
+                    Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                }
+            }
+        }
         let _ = self.child.start_kill();
     }
 }
@@ -985,25 +1218,44 @@ async fn wait_for_port(
     bail!("Chromium no escribió DevToolsActivePort en {timeout:?}")
 }
 
-async fn page_target_ws(port: u16) -> Result<String> {
-    let body = http_get(port, "/json/list").await?;
-    let targets: Value = serde_json::from_str(&body).context("/json/list no es JSON")?;
-    let list = targets.as_array().context("/json/list no es un array")?;
-    list.iter()
-        .find(|t| t.get("type").and_then(Value::as_str) == Some("page"))
-        .and_then(|t| t.get("webSocketDebuggerUrl"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .context("no hay un target de tipo page")
+/// Candado exclusivo del perfil persistente. El núcleo lo suelta solo si el
+/// proceso muere, así que no quedan candados huérfanos.
+fn lock_profile(profile: &Path) -> Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+
+        let path = profile.join(".navegador.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("no se pudo abrir {}", path.display()))?;
+        let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if taken != 0 {
+            bail!(
+                "el perfil {} ya lo usa otra ventana del navegador",
+                profile.display()
+            );
+        }
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = profile;
+        std::fs::File::open(std::env::temp_dir()).context("candado de perfil no disponible")
+    }
 }
 
-async fn http_get(port: u16, path: &str) -> Result<String> {
+async fn http_request(port: u16, method: &str, path: &str) -> Result<String> {
     let fut = async {
         let mut stream = TcpStream::connect(("127.0.0.1", port))
             .await
             .context("no se pudo conectar al endpoint HTTP de CDP")?;
-        let request =
-            format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        );
         stream.write_all(request.as_bytes()).await?;
 
         let mut buffer = Vec::new();
