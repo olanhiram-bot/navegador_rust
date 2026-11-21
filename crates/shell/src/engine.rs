@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
-use engine_cdp::{Browser, Chrome, ElementRef, Profile};
+use engine_cdp::{Browser, Chrome, DownloadEvent, ElementRef, Profile};
 use receipt::{Identity, ReceiptLog};
 use serde_json::Value;
 use session::{ActOptions, ActOutcome, Handoff, Session, SessionConfig};
@@ -79,6 +79,7 @@ pub enum Event {
         log: PathBuf,
     },
     CopyText(TabId, String),
+    Download(DownloadEvent),
     Found {
         tab: TabId,
         total: usize,
@@ -129,6 +130,11 @@ pub enum Command {
     Find {
         text: String,
         index: i64,
+    },
+    Permissions {
+        origin: String,
+        granted: Vec<String>,
+        denied: Vec<String>,
     },
     Shutdown,
 }
@@ -218,6 +224,20 @@ impl EngineHandle {
         let _ = self.commands.send(Command::Handoff);
     }
 
+    /// Fija los permisos de un origen en todas sus pestañas.
+    pub fn permissions(
+        &self,
+        origin: impl Into<String>,
+        granted: Vec<String>,
+        denied: Vec<String>,
+    ) {
+        let _ = self.commands.send(Command::Permissions {
+            origin: origin.into(),
+            granted,
+            denied,
+        });
+    }
+
     /// Busca en la página activa. `index` se toma módulo el total, así que
     /// avanzar y retroceder es sumar o restar uno.
     pub fn find(&self, text: impl Into<String>, index: i64) {
@@ -264,6 +284,8 @@ pub struct Options {
     pub log_path: PathBuf,
     /// `None` deja el perfil efímero (se borra al cerrar).
     pub profile: Option<PathBuf>,
+    /// Carpeta donde Chromium deja las descargas.
+    pub downloads: Option<PathBuf>,
 }
 
 /// `notify` despierta a la UI cuando hay un evento nuevo: sin él habría que
@@ -278,6 +300,7 @@ pub fn spawn_with_notify(
             initial_urls: vec![initial_url],
             log_path,
             profile: None,
+            downloads: None,
         },
         notify,
     )
@@ -327,6 +350,7 @@ struct State {
     log_base: PathBuf,
     browser: Option<Arc<Browser>>,
     profile: Option<PathBuf>,
+    downloads: Option<PathBuf>,
 }
 
 fn run(options: Options, mut commands: UnboundedReceiver<Command>, events: Emitter) -> Result<()> {
@@ -345,6 +369,7 @@ fn run(options: Options, mut commands: UnboundedReceiver<Command>, events: Emitt
             log_base: options.log_path,
             browser: None,
             profile: options.profile,
+            downloads: options.downloads,
         };
 
         for url in &options.initial_urls {
@@ -501,6 +526,29 @@ async fn handle_command(state: &mut State, command: Command, events: &Emitter) -
                 });
             }
         }
+        Command::Permissions {
+            origin,
+            granted,
+            denied,
+        } => {
+            let tabs: Vec<TabId> = state
+                .tabs
+                .iter()
+                .filter(|(_, tab)| {
+                    tab.session
+                        .url()
+                        .and_then(origin_of)
+                        .is_some_and(|current| current == origin)
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            for id in tabs {
+                state.tabs[&id]
+                    .session
+                    .set_permissions(&origin, &granted, &denied)
+                    .await?;
+            }
+        }
         Command::Approve { hash } => approve(state, &hash, events).await?,
         Command::Deny => deny(state, events),
         Command::Handoff => handoff(state, events).await,
@@ -596,6 +644,18 @@ async fn shared_browser(state: &mut State, events: &Emitter) -> Result<Arc<Brows
             .context("lanzar Chromium")?,
     };
     let browser = Arc::new(browser);
+    if let Some(dir) = state.downloads.clone() {
+        let emitter = events.clone();
+        browser
+            .watch_downloads(
+                dir,
+                Arc::new(move |download| {
+                    let _ = emitter.emit(Event::Download(download));
+                }),
+            )
+            .await
+            .ok();
+    }
     state.browser = Some(browser.clone());
     Ok(browser)
 }
@@ -758,6 +818,11 @@ async fn wait_for_url_change(
         Some(Err(error)) => Err(error),
         None => anyhow::bail!("la navegación no terminó"),
     }
+}
+
+fn origin_of(url: &str) -> Option<String> {
+    let origin = url::Url::parse(url).ok()?.origin().ascii_serialization();
+    (origin != "null").then_some(origin)
 }
 
 // Some(None) indica una verificación sin búsqueda recuperable.

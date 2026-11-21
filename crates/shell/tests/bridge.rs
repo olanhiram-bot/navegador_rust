@@ -390,6 +390,7 @@ fn restaura_varias_pestanas_y_reutiliza_el_perfil_al_reabrir() {
                 initial_urls: urls,
                 log_path: dir.path().join("recibos.jsonl"),
                 profile: Some(profile.clone()),
+                downloads: None,
             },
             std::sync::Arc::new(|| {}),
         )
@@ -555,6 +556,7 @@ fn un_perfil_ocupado_sigue_navegando_con_un_perfil_temporal() {
                 initial_urls: vec![url],
                 log_path: dir.path().join("recibos.jsonl"),
                 profile: Some(profile.clone()),
+                downloads: None,
             },
             std::sync::Arc::new(|| {}),
         )
@@ -603,5 +605,79 @@ fn buscar_en_la_pagina_cuenta_y_recorre_las_coincidencias() {
     wait_for(&handle, 10, found(0, -1));
     handle.find("", 0);
     wait_for(&handle, 10, found(0, -1));
+    handle.shutdown();
+}
+
+#[test]
+fn una_descarga_llega_a_la_carpeta_y_avisa_al_terminar() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("puerto local");
+    let base = format!(
+        "http://127.0.0.1:{}/",
+        listener.local_addr().unwrap().port()
+    );
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buffer = [0u8; 2048];
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            let head = String::from_utf8_lossy(&buffer[..read]);
+            let path = head.split_whitespace().nth(1).unwrap_or("/");
+            if path.starts_with("/file") {
+                let body = "contenido de prueba\n";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"informe.txt\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            } else {
+                let body = "<body><a href=\"/file\">Descargar</a></body>";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        }
+    });
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let downloads = dir.path().join("descargas");
+    let handle = shell::engine::spawn_with_options(
+        shell::engine::Options {
+            initial_urls: vec![base.clone()],
+            log_path: dir.path().join("log"),
+            profile: None,
+            downloads: Some(downloads.clone()),
+        },
+        std::sync::Arc::new(|| {}),
+    );
+    wait_for(&handle, 20, |event| matches!(event, Event::Snapshot { .. }));
+
+    handle.navigate(format!("{base}file"));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut finished = None;
+    while Instant::now() < deadline {
+        match handle.events.recv_timeout(Duration::from_millis(500)) {
+            Ok(Event::Download(download)) if download.state == engine_cdp::DownloadState::Done => {
+                finished = Some(download);
+                break;
+            }
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => panic!("el motor cerró el canal"),
+        }
+    }
+    let download = finished.expect("la descarga debe completarse y avisarse");
+    assert!(
+        download.path.starts_with(&downloads),
+        "debe ir a la carpeta configurada: {:?}",
+        download.path
+    );
+    assert_eq!(
+        std::fs::read_to_string(&download.path).unwrap().trim(),
+        "contenido de prueba"
+    );
     handle.shutdown();
 }

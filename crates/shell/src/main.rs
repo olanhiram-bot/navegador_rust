@@ -67,6 +67,7 @@ fn main() -> eframe::Result<()> {
         initial_urls,
         log_path,
         profile,
+        downloads: shell::estado::downloads_dir(),
     };
     let options_eframe = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

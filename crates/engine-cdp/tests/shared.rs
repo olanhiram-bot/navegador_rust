@@ -78,23 +78,29 @@ async fn el_perfil_persistente_conserva_las_cookies_tras_reiniciar() {
     );
     let mut first = Chrome::attach(browser.clone()).await.unwrap();
     first.navigate(&format!("{base}/?set=1")).await.unwrap();
-    // Esperar a que el servicio de red confirme la cookie antes de cerrar:
-    // Chromium escribe las cookies de forma diferida y un cierre inmediato
-    // puede adelantarse al volcado.
+    // Barrera: esperar a que el servicio de red tenga la cookie. Chromium
+    // escribe las cookies de forma diferida y un cierre inmediato puede
+    // adelantarse al volcado.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let text = first.read_text().await.unwrap();
-        if text.contains("sesion=demo") {
+        if first
+            .has_cookie(&format!("{base}/"), "sesion")
+            .await
+            .unwrap()
+        {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "la cookie no se leyó de vuelta: {text:?}"
+            "la cookie nunca llegó al servicio de red"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     drop(first);
+    // Cierre ordenado: además del SIGTERM de respaldo, pide a Chromium que
+    // vacíe el almacén de cookies antes de salir.
+    browser.close().await.expect("cierre ordenado");
     drop(browser);
 
     assert!(path.is_dir(), "el perfil persistente no debe borrarse");
@@ -106,11 +112,20 @@ async fn el_perfil_persistente_conserva_las_cookies_tras_reiniciar() {
     );
     let mut second = Chrome::attach(browser.clone()).await.unwrap();
     second.navigate(&format!("{base}/")).await.unwrap();
-    let text = second.read_text().await.unwrap();
-    assert!(
-        text.contains("sesion=demo"),
-        "la cookie debe sobrevivir al reinicio: {text:?}"
-    );
+    // El almacén de cookies se carga del disco en paralelo al arranque: una
+    // primera visita muy temprana puede no verla todavía.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let text = second.read_text().await.unwrap();
+        if text.contains("sesion=demo") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "la cookie debe sobrevivir al reinicio: {text:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

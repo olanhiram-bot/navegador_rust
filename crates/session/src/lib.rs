@@ -525,6 +525,16 @@ impl<E: Engine + Transport> Session<E> {
         Ok(self.engine.form_submitter().await?)
     }
 
+    /// Fija permisos del origen en esta pestaña.
+    pub async fn set_permissions(
+        &self,
+        origin: &str,
+        granted: &[String],
+        denied: &[String],
+    ) -> Result<(), SessionError> {
+        Ok(self.engine.set_permissions(origin, granted, denied).await?)
+    }
+
     /// Busca texto en la página; `index` elige la coincidencia resaltada.
     pub async fn find(&self, text: &str, index: i64) -> Result<engine::FindResult, SessionError> {
         Ok(self.engine.find(text, index).await?)

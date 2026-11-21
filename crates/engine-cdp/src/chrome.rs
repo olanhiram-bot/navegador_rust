@@ -238,6 +238,81 @@ impl Browser {
 
     /// Cierre ordenado: Chromium vuelca cookies e historial al perfil, igual
     /// que al cerrar una ventana.
+    /// Deja que Chromium escriba las descargas en `dir` y avisa de su avance.
+    /// Los eventos llegan por una conexión de navegador, no de pestaña: así no
+    /// se pierden cuando cambia la página.
+    pub async fn watch_downloads(
+        self: &Arc<Self>,
+        dir: PathBuf,
+        notify: Arc<dyn Fn(DownloadEvent) + Send + Sync>,
+    ) -> Result<()> {
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("no se pudo crear {}", dir.display()))?;
+        let version = http_request(self.port, "GET", "/json/version").await?;
+        let version: Value = serde_json::from_str(&version).context("/json/version no es JSON")?;
+        let ws = version
+            .get("webSocketDebuggerUrl")
+            .and_then(Value::as_str)
+            .context("/json/version sin WebSocket")?
+            .to_string();
+        let mut cdp = Cdp::connect(&ws).await?;
+        cdp.call(
+            "Browser.setDownloadBehavior",
+            json!({
+                "behavior": "allow",
+                "downloadPath": dir.to_string_lossy(),
+                "eventsEnabled": true,
+            }),
+        )
+        .await?;
+
+        let mut names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        tokio::spawn(async move {
+            while let Ok(Some(event)) = cdp.next_event(Duration::from_secs(3600)).await {
+                match event["method"].as_str() {
+                    Some("Browser.downloadWillBegin") => {
+                        let params = &event["params"];
+                        let id = params["guid"].as_str().unwrap_or_default().to_string();
+                        let name = params["suggestedFilename"]
+                            .as_str()
+                            .unwrap_or("descarga")
+                            .to_string();
+                        names.insert(id.clone(), name.clone());
+                        notify(DownloadEvent {
+                            id,
+                            name: name.clone(),
+                            path: dir.join(&name),
+                            state: DownloadState::Started,
+                        });
+                    }
+                    Some("Browser.downloadProgress") => {
+                        let params = &event["params"];
+                        let id = params["guid"].as_str().unwrap_or_default().to_string();
+                        let Some(name) = names.get(&id).cloned() else {
+                            continue;
+                        };
+                        let state = match params["state"].as_str() {
+                            Some("completed") => DownloadState::Done,
+                            Some("canceled") => DownloadState::Canceled,
+                            _ => DownloadState::Progress {
+                                received: params["receivedBytes"].as_u64().unwrap_or(0),
+                                total: params["totalBytes"].as_u64().unwrap_or(0),
+                            },
+                        };
+                        notify(DownloadEvent {
+                            id,
+                            name: name.clone(),
+                            path: dir.join(&name),
+                            state,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        });
+        Ok(())
+    }
+
     pub async fn close(&self) -> Result<()> {
         let version = http_request(self.port, "GET", "/json/version").await?;
         let version: Value = serde_json::from_str(&version).context("/json/version no es JSON")?;
@@ -280,6 +355,23 @@ impl Drop for Browser {
         }
         let _ = self.child.start_kill();
     }
+}
+
+/// Estado de una descarga observada por el navegador.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DownloadEvent {
+    pub id: String,
+    pub name: String,
+    pub path: PathBuf,
+    pub state: DownloadState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadState {
+    Started,
+    Progress { received: u64, total: u64 },
+    Done,
+    Canceled,
 }
 
 /// Chromium headless controlado por CDP.
@@ -460,6 +552,45 @@ impl Chrome {
             total: value["total"].as_u64().unwrap_or(0) as usize,
             current: value["current"].as_i64().unwrap_or(-1),
         })
+    }
+
+    /// ¿El servicio de red ya tiene esta cookie para la URL? Sirve como
+    /// barrera: `document.cookie` puede devolver el valor antes de que la
+    /// escritura llegue al servicio.
+    pub async fn has_cookie(&self, url: &str, name: &str) -> Result<bool> {
+        let cookies = self
+            .cdp
+            .call("Network.getCookies", json!({ "urls": [url] }))
+            .await?;
+        Ok(cookies["cookies"]
+            .as_array()
+            .is_some_and(|list| list.iter().any(|cookie| cookie["name"] == name)))
+    }
+
+    /// Concede o deniega permisos a un origen. `Browser.setPermission` fija
+    /// cada permiso por separado, así que cambiar de concedido a denegado
+    /// siempre gana.
+    pub async fn set_permissions(
+        &self,
+        origin: &str,
+        granted: &[String],
+        denied: &[String],
+    ) -> Result<()> {
+        for (names, setting) in [(granted, "granted"), (denied, "denied")] {
+            for name in names {
+                self.cdp
+                    .call(
+                        "Browser.setPermission",
+                        json!({
+                            "permission": { "name": name },
+                            "setting": setting,
+                            "origin": origin,
+                        }),
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     /// Selector del botón que enviaría el formulario del campo con el foco.
@@ -989,6 +1120,15 @@ impl Engine for Chrome {
         index: i64,
     ) -> impl std::future::Future<Output = Result<FindResult>> + Send {
         Chrome::find(self, text, index)
+    }
+
+    fn set_permissions(
+        &self,
+        origin: &str,
+        granted: &[String],
+        denied: &[String],
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        Chrome::set_permissions(self, origin, granted, denied)
     }
 }
 

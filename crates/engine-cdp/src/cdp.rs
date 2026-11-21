@@ -73,6 +73,8 @@ impl Cdp {
                                     | "Page.screencastFrame"
                                     | "Page.navigatedWithinDocument"
                                     | "Page.domContentEventFired"
+                                    | "Browser.downloadWillBegin"
+                                    | "Browser.downloadProgress"
                             )
                         ) {
                             let _ = events_tx.send(value);

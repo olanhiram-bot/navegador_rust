@@ -32,6 +32,15 @@ struct PendingCard {
     hash: String,
 }
 
+struct DownloadItem {
+    id: String,
+    name: String,
+    path: PathBuf,
+    state: engine_cdp::DownloadState,
+    received: u64,
+    total: u64,
+}
+
 #[derive(Default)]
 struct Receipts {
     count: usize,
@@ -56,6 +65,8 @@ pub struct ShellApp {
     generation: u32,
     selection_origin: Option<egui::Pos2>,
     last_viewport: (Vec2, f32),
+    downloads: Vec<DownloadItem>,
+    downloads_open: bool,
     /// Barra de búsqueda dentro de la página (Ctrl+F).
     find_open: bool,
     find_text: String,
@@ -66,6 +77,9 @@ pub struct ShellApp {
     find_query: String,
     /// Zoom por origen, persistido en `ajustes.json`.
     zoom: std::collections::BTreeMap<String, f32>,
+    /// Permisos por origen, también en `ajustes.json`.
+    permisos: std::collections::BTreeMap<String, crate::estado::Permisos>,
+    permisos_open: bool,
     settings_path: Option<PathBuf>,
     /// Dónde se guarda la sesión; `None` con perfil efímero.
     session_path: Option<PathBuf>,
@@ -92,11 +106,12 @@ impl ShellApp {
         style.spacing.button_padding = egui::vec2(9.0, 4.0);
         ctx.set_style_of(egui::Theme::Dark, style);
 
-        let zoom = settings_path
+        let settings = settings_path
             .as_deref()
             .map(crate::estado::load_settings)
-            .map(|settings| settings.zoom)
             .unwrap_or_default();
+        let zoom = settings.zoom;
+        let permisos = settings.permisos;
         let first = options
             .initial_urls
             .last()
@@ -123,6 +138,8 @@ impl ShellApp {
             generation: 0,
             selection_origin: None,
             last_viewport: (Vec2::ZERO, 0.0),
+            downloads: Vec::new(),
+            downloads_open: false,
             find_open: false,
             find_text: String::new(),
             find_total: 0,
@@ -130,6 +147,8 @@ impl ShellApp {
             find_focus: false,
             find_query: String::new(),
             zoom,
+            permisos,
+            permisos_open: false,
             settings_path,
             session_path,
             saved_session: None,
@@ -234,6 +253,9 @@ impl ShellApp {
                     if Some(tab) == self.active && self.find_open {
                         self.reset_find();
                     }
+                    if Some(tab) == self.active {
+                        self.apply_stored_permissions(&info.url);
+                    }
                     if let Some(known) = self.tabs.iter_mut().find(|known| known.id == tab) {
                         known.url = info.url.clone();
                         known.title = info.title.clone();
@@ -325,6 +347,42 @@ impl ShellApp {
                             format!("coincidencia {} de {total}", current + 1)
                         };
                     }
+                }
+                Event::Download(download) => {
+                    if let Some(item) = self
+                        .downloads
+                        .iter_mut()
+                        .find(|item| item.id == download.id)
+                    {
+                        item.state = download.state;
+                        if let engine_cdp::DownloadState::Progress { received, total } =
+                            download.state
+                        {
+                            item.received = received;
+                            item.total = total;
+                        }
+                    } else {
+                        self.downloads.push(DownloadItem {
+                            id: download.id.clone(),
+                            name: download.name.clone(),
+                            path: download.path.clone(),
+                            state: download.state,
+                            received: 0,
+                            total: 0,
+                        });
+                    }
+                    self.status = match download.state {
+                        engine_cdp::DownloadState::Started => {
+                            format!("descargando «{}»…", download.name)
+                        }
+                        engine_cdp::DownloadState::Done => {
+                            format!("descarga completa: {}", download.path.display())
+                        }
+                        engine_cdp::DownloadState::Canceled => {
+                            format!("descarga cancelada: {}", download.name)
+                        }
+                        engine_cdp::DownloadState::Progress { .. } => self.status.clone(),
+                    };
                 }
                 Event::Notice(notice) => self.status = notice,
                 Event::Error(error) => self.status = format!("error: {error}"),
@@ -532,6 +590,30 @@ impl ShellApp {
                 && let Some(url) = external_url.map(str::to_owned)
             {
                 self.open_external(&url);
+            }
+            let origin = self
+                .tabs
+                .iter()
+                .find(|tab| Some(tab.id) == self.active)
+                .and_then(|tab| crate::estado::zoom_key(&tab.url));
+            if ui
+                .add_enabled(origin.is_some(), egui::Button::new("Permisos"))
+                .on_hover_text("Permisos de este sitio")
+                .clicked()
+            {
+                self.permisos_open = !self.permisos_open;
+            }
+            if !self.downloads.is_empty()
+                && ui
+                    .selectable_label(
+                        self.downloads_open,
+                        egui::RichText::new(format!("Descargas ({})", self.downloads.len()))
+                            .size(12.0),
+                    )
+                    .on_hover_text("Descargas de esta sesión")
+                    .clicked()
+            {
+                self.downloads_open = !self.downloads_open;
             }
             if ui
                 .selectable_label(self.agent_open, egui::RichText::new("Agente").size(12.0))
@@ -808,6 +890,116 @@ impl ShellApp {
 
     /// Buscador flotante. No altera el contenido: resalta por CSS y lleva la
     /// coincidencia actual a la vista.
+    fn downloads_window(&mut self, ctx: &egui::Context) {
+        if !self.downloads_open {
+            return;
+        }
+        let mut open = self.downloads_open;
+        egui::Window::new("Descargas")
+            .id(egui::Id::unique("ventana-descargas"))
+            .open(&mut open)
+            .anchor(egui::Align2::RIGHT_BOTTOM, Vec2::new(-24.0, -48.0))
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                if self.downloads.is_empty() {
+                    ui.label("Todavía no hay descargas en esta sesión.");
+                    return;
+                }
+                for item in &self.downloads {
+                    ui.horizontal(|ui| {
+                        let detail = match item.state {
+                            engine_cdp::DownloadState::Done => "completada".to_string(),
+                            engine_cdp::DownloadState::Canceled => "cancelada".to_string(),
+                            engine_cdp::DownloadState::Started => "empezando…".to_string(),
+                            engine_cdp::DownloadState::Progress { received, total } => {
+                                if total > 0 {
+                                    format!("{} %", (received * 100 / total).min(100))
+                                } else {
+                                    "descargando…".to_string()
+                                }
+                            }
+                        };
+                        ui.label(egui::RichText::new(&item.name).size(12.0));
+                        ui.label(egui::RichText::new(detail).size(11.0).color(MUTED));
+                        if item.state == engine_cdp::DownloadState::Done
+                            && ui.button("Abrir").clicked()
+                        {
+                            let _ = webbrowser::open(&item.path.to_string_lossy());
+                        }
+                        if item.state == engine_cdp::DownloadState::Done
+                            && ui.button("Carpeta").clicked()
+                            && let Some(dir) = item.path.parent()
+                        {
+                            let _ = webbrowser::open(&dir.to_string_lossy());
+                        }
+                    });
+                }
+            });
+        self.downloads_open = open;
+    }
+
+    fn permisos_window(&mut self, ctx: &egui::Context) {
+        if !self.permisos_open {
+            return;
+        }
+        let Some(origin) = self
+            .active_url()
+            .and_then(|url| crate::estado::zoom_key(&url))
+        else {
+            self.permisos_open = false;
+            return;
+        };
+        let mut permisos = self.permisos.get(&origin).copied().unwrap_or_default();
+        let before = permisos;
+        let mut open = self.permisos_open;
+        egui::Window::new("Permisos del sitio")
+            .id(egui::Id::unique("ventana-permisos"))
+            .open(&mut open)
+            .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-18.0, 58.0))
+            .default_width(300.0)
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new(&origin).size(12.0).color(MUTED));
+                ui.add_space(4.0);
+                ui.checkbox(&mut permisos.notificaciones, "Notificaciones");
+                ui.checkbox(&mut permisos.ubicacion, "Ubicación");
+                ui.checkbox(&mut permisos.camara, "Cámara");
+                ui.checkbox(&mut permisos.microfono, "Micrófono");
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Lo desmarcado se deniega: el sitio no puede pedirlo sin avisarte.",
+                    )
+                    .size(11.0)
+                    .color(MUTED),
+                );
+            });
+        self.permisos_open = open;
+        if permisos != before {
+            self.permisos.insert(origin.clone(), permisos);
+            self.handle
+                .permissions(origin.clone(), permisos.granted(), permisos.denied());
+            if let Some(path) = &self.settings_path {
+                let settings = crate::estado::Settings {
+                    zoom: self.zoom.clone(),
+                    permisos: self.permisos.clone(),
+                };
+                if let Err(error) = crate::estado::save_settings(path, &settings) {
+                    self.status = format!("no se pudieron guardar los permisos: {error}");
+                }
+            }
+        }
+    }
+
+    fn apply_stored_permissions(&self, url: &str) {
+        let Some(origin) = crate::estado::zoom_key(url) else {
+            return;
+        };
+        if let Some(permisos) = self.permisos.get(&origin) {
+            self.handle
+                .permissions(origin.clone(), permisos.granted(), permisos.denied());
+        }
+    }
+
     fn find_bar(&mut self, ctx: &egui::Context) {
         if !self.find_open {
             return;
@@ -923,6 +1115,7 @@ impl ShellApp {
         if let Some(path) = &self.settings_path {
             let settings = crate::estado::Settings {
                 zoom: self.zoom.clone(),
+                permisos: self.permisos.clone(),
             };
             if let Err(error) = crate::estado::save_settings(path, &settings) {
                 self.status = format!("no se pudo guardar el zoom: {error}");
@@ -1197,6 +1390,8 @@ impl eframe::App for ShellApp {
             self.set_zoom(1.0);
         }
         self.find_bar(ui.ctx());
+        self.downloads_window(ui.ctx());
+        self.permisos_window(ui.ctx());
 
         egui::Panel::top("chrome")
             .frame(

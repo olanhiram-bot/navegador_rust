@@ -242,6 +242,17 @@ pub trait Engine {
         async { Ok(None) }
     }
 
+    /// Fija permisos del origen: `granted` y `denied` son nombres de CDP
+    /// (`notifications`, `geolocation`, `audioCapture`, `videoCapture`).
+    fn set_permissions(
+        &self,
+        _origin: &str,
+        _granted: &[String],
+        _denied: &[String],
+    ) -> impl Future<Output = anyhow::Result<()>> + Send {
+        async { Ok(()) }
+    }
+
     /// Busca texto en la página y resalta las coincidencias.
     fn find(
         &self,

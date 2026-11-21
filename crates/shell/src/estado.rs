@@ -61,6 +61,16 @@ pub fn session_path() -> Option<PathBuf> {
     Some(state_dir()?.join("sesion.json"))
 }
 
+/// `$NAVEGADOR_DESCARGAS` o `~/Downloads` (creándolo si hace falta).
+pub fn downloads_dir() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("NAVEGADOR_DESCARGAS") {
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+    Some(PathBuf::from(home()?).join("Downloads"))
+}
+
 pub fn settings_path() -> Option<PathBuf> {
     Some(state_dir()?.join("ajustes.json"))
 }
@@ -71,6 +81,50 @@ pub struct Settings {
     /// Zoom por origen, p. ej. `https://ejemplo.com` → 1.25.
     #[serde(default)]
     pub zoom: std::collections::BTreeMap<String, f32>,
+    /// Permisos concedidos o denegados por origen.
+    #[serde(default)]
+    pub permisos: std::collections::BTreeMap<String, Permisos>,
+}
+
+/// Permisos que se pueden conceder. Todo en `false` es denegar.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Permisos {
+    pub notificaciones: bool,
+    pub ubicacion: bool,
+    pub camara: bool,
+    pub microfono: bool,
+}
+
+impl Permisos {
+    pub fn granted(self) -> Vec<String> {
+        let mut names = Vec::new();
+        if self.notificaciones {
+            names.push("notifications".to_string());
+        }
+        if self.ubicacion {
+            names.push("geolocation".to_string());
+        }
+        if self.camara {
+            names.push("videoCapture".to_string());
+        }
+        if self.microfono {
+            names.push("audioCapture".to_string());
+        }
+        names
+    }
+
+    pub fn denied(self) -> Vec<String> {
+        [
+            "notifications",
+            "geolocation",
+            "videoCapture",
+            "audioCapture",
+        ]
+        .into_iter()
+        .filter(|name| !self.granted().iter().any(|granted| granted == name))
+        .map(str::to_string)
+        .collect()
+    }
 }
 
 pub fn load_settings(path: &Path) -> Settings {
