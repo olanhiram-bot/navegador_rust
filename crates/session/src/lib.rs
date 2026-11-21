@@ -301,6 +301,15 @@ impl<E: Engine> Session<E> {
         self.snapshot_now().await
     }
 
+    /// Ref `@eN` del snapshot vivo para un selector CSS, si sigue presente.
+    pub fn reference_for_selector(&self, selector: &str) -> Option<&ElementRef> {
+        self.snapshot
+            .as_ref()?
+            .elements
+            .iter()
+            .find(|element| element.selector == selector)
+    }
+
     /// Invalida todas las refs (la página puede haber cambiado por su cuenta).
     pub fn refresh(&mut self) {
         self.generation += 1;
@@ -509,6 +518,11 @@ impl<E: Engine + Transport> Session<E> {
 
     pub async fn link_href(&mut self, selector: &str) -> Result<Option<String>, SessionError> {
         Ok(self.engine.link_href(selector).await?)
+    }
+
+    /// Selector del control que un Enter enviaría desde el campo enfocado.
+    pub async fn form_submitter(&self) -> Result<Option<String>, SessionError> {
+        Ok(self.engine.form_submitter().await?)
     }
 
     pub async fn youtube_search_query(

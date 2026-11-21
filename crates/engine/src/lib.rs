@@ -228,4 +228,9 @@ pub trait Engine {
 
     /// Texto visible de la página, sin interpretar.
     fn read_text(&mut self) -> impl Future<Output = anyhow::Result<String>> + Send;
+
+    /// Selector del control que un Enter enviaría desde el campo con el foco.
+    fn form_submitter(&self) -> impl Future<Output = anyhow::Result<Option<String>>> + Send {
+        async { Ok(None) }
+    }
 }

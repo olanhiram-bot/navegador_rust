@@ -47,7 +47,7 @@ En la compilación optimizada, el clic tarda casi la mitad que en la medición i
 ## 3. Tareas delegadas que puedas verificar
 
 - [ ] **Compartir la pestaña entre la ventana y el agente.** Conectar el panel al agente y verificar que el traspaso conserva URL, pestaña, scroll y estado del formulario.
-- [ ] **Vincular la aprobación a la petición.** Cubrir envíos desde teclado, formularios y controles dinámicos. Verificar con fixtures que se detienen los envíos que cambian tras aprobarse y que cada envío autorizado produce su recibo.
+- [ ] **Vincular la aprobación a la petición.** Cubrir envíos desde teclado, formularios y controles dinámicos. Verificar con fixtures que se detienen los envíos que cambian tras aprobarse y que cada envío autorizado produce su recibo. Desde 2026-11-20 un Enter en un campo de formulario abre la misma tarjeta y deja recibo que un clic en su botón, y una prueba comprueba que no sale ninguna petición antes de aprobar; faltan los controles que envían sin formulario ni botón.
 - [ ] **Completar tres recorridos.** Comparar productos, rellenar un formulario y preparar una reserva para aprobación. Empezar con fixtures y continuar en entornos de prueba autorizados. Medir tasa de éxito, intervenciones y correspondencia entre lo aprobado y lo enviado.
 - [ ] **Hacer los recibos fáciles de inspeccionar.** Mostrar destino, datos relevantes y resultado. Proteger la información sensible y verificar la firma sin conexión.
 

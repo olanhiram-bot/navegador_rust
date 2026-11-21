@@ -19,6 +19,7 @@ const EXTRACT_JS: &str = include_str!("extract.js");
 const SNAPSHOT_JS: &str = include_str!("snapshot.js");
 const ELEMENT_NAME_JS: &str = include_str!("element-name.js");
 const HIT_JS: &str = include_str!("hit.js");
+const SUBMITTER_JS: &str = include_str!("submitter.js");
 
 /// Perfil de Chromium: efímero (directorio temporal que se borra al cerrar) o
 /// persistente (conserva cookies e inicios de sesión entre arranques).
@@ -439,6 +440,18 @@ impl Chrome {
         let expression = format!("({HIT_JS})({x}, {y})");
         let text = self.evaluate_isolated(&expression).await?;
         let value: Value = serde_json::from_str(&text).context("JSON de hit-test inválido")?;
+        Ok(value
+            .get("selector")
+            .and_then(Value::as_str)
+            .map(str::to_string))
+    }
+
+    /// Selector del botón que enviaría el formulario del campo con el foco.
+    /// `None` si el foco no está en un formulario o no hay control de envío.
+    pub async fn form_submitter(&self) -> Result<Option<String>> {
+        let expression = format!("({SUBMITTER_JS})()");
+        let text = self.evaluate_isolated(&expression).await?;
+        let value: Value = serde_json::from_str(&text).context("JSON de formulario inválido")?;
         Ok(value
             .get("selector")
             .and_then(Value::as_str)
@@ -948,6 +961,10 @@ impl Engine for Chrome {
 
     fn read_text(&mut self) -> impl std::future::Future<Output = Result<String>> + Send {
         Chrome::read_text(self)
+    }
+
+    fn form_submitter(&self) -> impl std::future::Future<Output = Result<Option<String>>> + Send {
+        Chrome::form_submitter(self)
     }
 }
 

@@ -423,3 +423,123 @@ fn restaura_varias_pestanas_y_reutiliza_el_perfil_al_reabrir() {
     first_snapshot(&handle);
     handle.shutdown();
 }
+
+#[test]
+fn enter_en_un_campo_pasa_por_la_tarjeta_y_no_escapa_solo() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    // El servidor registra lo que llega: nada debe salir antes de aprobar.
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("puerto local");
+    let url = format!(
+        "http://127.0.0.1:{}/",
+        listener.local_addr().unwrap().port()
+    );
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buffer = vec![0u8; 4096];
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            let head = String::from_utf8_lossy(&buffer[..read]).to_string();
+            let (start, body) = head.split_once("\r\n\r\n").unwrap_or((&head, ""));
+            let mut request = start.lines().next().unwrap_or("").to_string();
+            if let Some(length) = start.lines().find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())?
+            }) && body.len() < length
+            {
+                let mut rest = vec![0u8; length - body.len()];
+                let extra = stream.read(&mut rest).unwrap_or(0);
+                request.push_str(&String::from_utf8_lossy(&rest[..extra]));
+            }
+            if start.starts_with("POST") {
+                record.lock().unwrap().push(format!("{request} {body}"));
+            }
+            let page = if start.starts_with("POST") {
+                "<body>gracias</body>"
+            } else {
+                "<body><form method=POST action=/enviar><input name=q><button>Enviar</button></form></body>"
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
+                page.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let handle = spawn(url, dir.path().join("recibos.jsonl"));
+    let (_, elements) = first_snapshot(&handle);
+    let field = elements
+        .iter()
+        .find(|element| element.role == "textbox")
+        .expect("el formulario tiene un campo de texto");
+    handle.click(field.x, field.y);
+    wait_for(
+        &handle,
+        10,
+        |event| matches!(event, Event::Notice(notice) if notice.contains("enfocado")),
+    );
+    handle.insert_text("hola");
+    std::thread::sleep(Duration::from_millis(300));
+
+    handle.key("Enter", "Enter", 13, 0);
+    let hash = match wait_for(&handle, 15, |event| {
+        matches!(
+            event,
+            Event::Act {
+                outcome: ActOutcome::ApprovalRequired { .. },
+                ..
+            }
+        )
+    }) {
+        Event::Act {
+            outcome: ActOutcome::ApprovalRequired { hash, card, .. },
+            ..
+        } => {
+            assert!(
+                card.rows.iter().any(|row| row.value.contains("hola")),
+                "la tarjeta debe mostrar lo que se va a enviar: {:?}",
+                card.rows
+            );
+            hash
+        }
+        _ => unreachable!(),
+    };
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "no debe escapar ninguna petición antes de aprobar: {:?}",
+        seen.lock().unwrap()
+    );
+
+    handle.approve(hash);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let (mut executed, mut receipts) = (false, false);
+    while !executed || !receipts {
+        let left = deadline.saturating_duration_since(Instant::now());
+        assert!(!left.is_zero(), "faltó el acto ejecutado o el recibo");
+        match handle
+            .events
+            .recv_timeout(left.min(Duration::from_millis(500)))
+        {
+            Ok(Event::Error(error)) => panic!("error del motor: {error}"),
+            Ok(Event::Act {
+                outcome: ActOutcome::Executed { .. },
+                ..
+            }) => executed = true,
+            Ok(Event::Receipts { count: 1, .. }) => receipts = true,
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => panic!("el motor cerró el canal"),
+        }
+    }
+    let sent = seen.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1, "debe llegar exactamente un envío: {sent:?}");
+    assert!(sent[0].contains("q=hola"), "envío inesperado: {sent:?}");
+    handle.shutdown();
+}

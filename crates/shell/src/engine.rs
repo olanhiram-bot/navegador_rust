@@ -465,6 +465,9 @@ async fn handle_command(state: &mut State, command: Command, events: &Emitter) -
             virtual_key,
             modifiers,
         } => {
+            if key == "Enter" && modifiers == 0 && submit_with_enter(state, events).await? {
+                return Ok(false);
+            }
             if let Some(tab) = active_tab(state) {
                 tab.session.key(&key, &code, virtual_key, modifiers).await?;
             }
@@ -847,7 +850,45 @@ async fn click(state: &mut State, x: f64, y: f64, events: &Emitter) -> Result<()
         }
     };
 
-    settle_act(state, id, &element.reference, options, outcome, events).await
+    settle_act(state, id, &element.reference, options, outcome, events).await?;
+    Ok(())
+}
+
+/// Enter en un campo de un formulario equivale a pulsar su botón de envío: pasa
+/// por tarjeta y recibo igual que un clic, en vez de salir por la red directo.
+async fn submit_with_enter(state: &mut State, events: &Emitter) -> Result<bool> {
+    let Some(id) = state.active else {
+        return Ok(false);
+    };
+    let element = {
+        let tab = &state.tabs[&id];
+        let Some(selector) = tab.session.form_submitter().await? else {
+            return Ok(false);
+        };
+        let Some(element) = tab.session.reference_for_selector(&selector) else {
+            return Ok(false);
+        };
+        if element.role != "button" || element.disabled {
+            return Ok(false);
+        }
+        element.clone()
+    };
+    let options = ActOptions {
+        generation: Some(state.tabs[&id].session.generation()),
+        ..ActOptions::default()
+    };
+    let outcome = {
+        let tab = state.tabs.get_mut(&id).expect("pestaña activa");
+        match tab.session.act(&element.reference, options.clone()).await {
+            Err(error @ session::SessionError::ElementChanged(_)) => {
+                refresh_snapshot(state, id, events).await?;
+                return Err(error.into());
+            }
+            result => result?,
+        }
+    };
+    settle_act(state, id, &element.reference, options, outcome, events).await?;
+    Ok(true)
 }
 
 async fn approve(state: &mut State, hash: &str, events: &Emitter) -> Result<()> {
