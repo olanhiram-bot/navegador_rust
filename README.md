@@ -153,11 +153,27 @@ El punto clave: el árbol de accesibilidad solo ve la etiqueta que miente. El
 descriptor se construye desde DOM, estado de formulario y origen resuelto, y el
 binding compara la petición interceptada con lo aprobado.
 
+## Comparación de escritorio
+
+El comparador usa perfiles aislados y la misma página local para Chrome, Brave y la ventana del proyecto. Puede incluir [el candidato nativo de Qt](qt/README.md). Ejecútalo en una sesión Wayland de pruebas con una versión release y un archivo WebM local que incluya video y audio.
+
+```sh
+scripts/benchmark-desktop --chrome /usr/bin/google-chrome-stable \
+  --brave /usr/bin/brave --navegador target/release/navegador-gpui \
+  --video /ruta/video.webm --rounds 5 --memory-tabs --output /tmp/navegador-prueba
+```
+
+En Hyprland, `--hyprland-focus` enfoca las ventanas creadas por el comparador. `muestras.jsonl` conserva arranque con perfil nuevo o reutilizado, intervalos de animación durante scroll, CPU del árbol de procesos al reproducir, memoria PSS y errores. La confirmación por animación de la página y los intervalos de `requestAnimationFrame` son señales internas del motor. La latencia visible requiere medir la presentación del compositor.
+
 ## El recibo
 
 El recibo lleva el descriptor, la petición real (`wire`), el resultado y la clave
 pública; la firma cubre el JSON canónico de todo eso. `verify` comprueba, en
 orden: esquema, firma, hash del descriptor y binding petición↔descriptor.
+Para verificar offline el log completo de una pestaña, ejecuta
+`navegador verify-log /ruta/recibos-tab0.jsonl` desde la instalación local.
+El comando muestra cuántos recibos verificaron e indica si hay una firma,
+secuencia o entrada dañada. Guardar por separado el hash de la última entrada permite detectar que falta el final de una cadena.
 
 Es autocontenido: prueba integridad y binding, **no identidad**. Para saber que
 lo emitió *tu* navegador hay que fijar su clave pública. Es un límite

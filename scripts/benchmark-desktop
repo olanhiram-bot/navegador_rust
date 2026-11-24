@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""Recorridos locales reproducibles para navegadores de escritorio en Linux."""
+
+import argparse
+from collections import defaultdict
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import os
+import re
+from pathlib import Path
+import signal
+import statistics
+import subprocess
+import tempfile
+import threading
+import time
+from urllib.parse import urlsplit
+import uuid
+
+
+PAGE = b"""<!doctype html><meta charset="utf-8"><title>Navegador benchmark</title>
+<style>body{margin:0;background:#fff}video{display:block;width:640px;height:360px}
+article{height:15000px;background:repeating-linear-gradient(#057 0 30px,#fd9 30px 60px)}</style>
+<video autoplay muted loop playsinline src="/video.webm"></video><article></article>
+<script>
+const base = location.pathname;
+const mark = (name, data = {}) => fetch(base + "/" + name, {
+  method: "POST", body: JSON.stringify(data), keepalive: true
+});
+const video = document.querySelector("video");
+requestAnimationFrame(() => requestAnimationFrame(() => mark("raf", {
+  width: innerWidth, height: innerHeight, dpr: devicePixelRatio,
+  focused: document.hasFocus()
+})));
+let playbackReported = false;
+const playback = () => {
+  if (playbackReported) return;
+  playbackReported = true;
+  mark("playing", {viewport: [innerWidth, innerHeight], focused: document.hasFocus()});
+};
+video.requestVideoFrameCallback(playback);
+video.addEventListener("timeupdate", () => {
+  if (video.currentTime > 0.1) playback();
+});
+const mediaError = (code, message) => mark("media-error", {code, message});
+video.addEventListener("error", () => mediaError(video.error.code, video.error.message));
+video.play().catch(error => mediaError(error.name, error.message));
+fetch(base + "/start-scroll").then(response => {
+  if (!response.ok) return;
+  video.pause();
+  const intervals = [];
+  let previous;
+  let start;
+  function frame(now) {
+    if (start === undefined) start = now;
+    scrollTo(0, intervals.length * 40);
+    if (previous !== undefined) intervals.push(now - previous);
+    previous = now;
+    if (intervals.length < 90 && now - start < 3500) requestAnimationFrame(frame);
+    else mark("scroll-result", {intervals});
+  }
+  requestAnimationFrame(frame);
+});
+</script>
+"""
+
+
+class Fixture(ThreadingHTTPServer):
+    def __init__(self, video):
+        self.video = video
+        self.events = {}
+        self.ready = threading.Condition()
+        super().__init__(("127.0.0.1", 0), Handler)
+
+    def mark(self, path, data=None):
+        with self.ready:
+            self.events.setdefault(path, (time.monotonic(), data))
+            self.ready.notify_all()
+
+    def wait(self, path, timeout, error_path=None):
+        with self.ready:
+            if not self.ready.wait_for(lambda: path in self.events or error_path in self.events, timeout):
+                raise TimeoutError(f"no llegó la señal de {path}")
+            if error_path in self.events:
+                raise RuntimeError(f"reproducción fallida: {self.events[error_path][1]}")
+            return self.events[path]
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *_args):
+        pass
+
+    def do_GET(self):
+        path = urlsplit(self.path).path
+        parts = path.split("/")
+        if len(parts) == 4 and parts[1] == "p" and parts[3] == "start-scroll":
+            try:
+                self.server.wait(self.path, 90)
+            except TimeoutError:
+                self.send_error(408)
+            else:
+                self.send_response(204)
+                self.end_headers()
+            return
+        if len(parts) == 4 and parts[1] == "tabs" and parts[3] == "loaded":
+            self.server.mark(path)
+            self.send_response(204)
+            self.end_headers()
+            return
+        start, end = None, None
+        if parts == ["", "video.webm"]:
+            data, mime = self.server.video, "video/webm"
+            range_header = self.headers.get("Range", "")
+            match = re.fullmatch(r"bytes=(\d+)-(\d*)", range_header)
+            if match:
+                start = int(match[1])
+                end = min(int(match[2] or len(data) - 1), len(data) - 1)
+                if start > end:
+                    self.send_error(416)
+                    return
+        elif len(parts) == 3 and parts[1] == "p":
+            data, mime = PAGE, "text/html"
+        elif len(parts) == 3 and parts[1] == "tabs":
+            data = (
+                "<!doctype html><meta charset='utf-8'><title>Pestaña de prueba</title>"
+                "<article>Una página de texto para medir memoria.</article>"
+                "<script>fetch(location.pathname + '/loaded');</script>"
+            ).encode()
+            mime = "text/html"
+        else:
+            self.send_error(404)
+            return
+        if start is not None:
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}")
+            data = data[start:end + 1]
+        else:
+            self.send_response(200)
+        if mime == "video/webm":
+            self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Type", mime)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def do_POST(self):
+        path = urlsplit(self.path).path
+        try:
+            size = int(self.headers.get("Content-Length", 0))
+            if not 0 < size <= 8192:
+                raise ValueError()
+            data = json.loads(self.rfile.read(size))
+        except ValueError:
+            self.send_error(400)
+            return
+        self.server.mark(path, data)
+        self.send_response(204)
+        self.end_headers()
+
+
+def process_tree(root):
+    procs = {}
+    for stat in Path("/proc").glob("[0-9]*/stat"):
+        try:
+            fields = stat.read_text().rsplit(")", 1)[1].split()
+            procs[int(stat.parent.name)] = (int(fields[1]), int(fields[11]) + int(fields[12]))
+        except (OSError, IndexError, ValueError):
+            continue
+    children = {root}
+    while True:
+        more = {pid for pid, (parent, _) in procs.items() if parent in children} - children
+        if not more:
+            return {pid: procs[pid][1] for pid in children if pid in procs}
+        children.update(more)
+
+
+def memory_mib(pids):
+    total = 0
+    for pid in pids:
+        try:
+            for line in Path(f"/proc/{pid}/smaps_rollup").read_text().splitlines():
+                if line.startswith("Pss:"):
+                    total += int(line.split()[1])
+                    break
+        except OSError:
+            continue
+    return round(total / 1024, 2)
+
+
+@contextmanager
+def browser(args, env, log):
+    with log.open("wb") as output:
+        proc = subprocess.Popen(args, env=env, stdout=output, stderr=output, start_new_session=True)
+        try:
+            yield proc
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+
+def launch(name, executable, profile, urls):
+    env = dict(os.environ, XDG_CONFIG_HOME=str(profile / "config"), XDG_DATA_HOME=str(profile / "data"),
+               XDG_STATE_HOME=str(profile / "state"), XDG_CACHE_HOME=str(profile / "cache"),
+               NAVEGADOR_DESCARGAS=str(profile / "downloads"))
+    if name in ("Chrome", "Brave"):
+        args = [executable, "--ozone-platform=wayland", "--no-first-run",
+                "--no-default-browser-check", f"--user-data-dir={profile / 'profile'}", *urls]
+    elif name == "Qt":
+        env.update(QT_QPA_PLATFORM="wayland", QTWEBENGINE_REMOTE_DEBUGGING="127.0.0.1:0")
+        args = [executable, *urls]
+    else:
+        if len(urls) == 1:
+            args = [executable, "--sin-restaurar", urls[0]]
+        else:
+            session = profile / "state" / "navegador" / "sesion.json"
+            session.parent.mkdir(parents=True)
+            session.write_text(json.dumps({"active": len(urls)-1, "tabs": [{"url": url} for url in urls]}))
+            args = [executable]
+    return args, env
+
+
+def focus_hyprland(proc, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"el navegador terminó con código {proc.returncode}")
+        pids = process_tree(proc.pid)
+        clients = json.loads(subprocess.check_output(["hyprctl", "-j", "clients"], timeout=3))
+        for client in clients:
+            if client["mapped"] and client["pid"] in pids:
+                subprocess.run(
+                    ["hyprctl", "dispatch", "focuswindow", f"address:{client['address']}"],
+                    check=True, timeout=3, stdout=subprocess.DEVNULL,
+                )
+                return {"ancho": client["size"][0], "alto": client["size"][1]}
+        time.sleep(0.1)
+    raise TimeoutError("la ventana de prueba no apareció en Hyprland")
+
+
+def measure(fixture, options, name, executable, profile, label, cold):
+    token = "/p/" + uuid.uuid4().hex
+    url = f"http://127.0.0.1:{fixture.server_port}{token}"
+    args, env = launch(name, executable, profile, [url])
+    start = time.monotonic()
+    with browser(args, env, options.output / f"{label}.log") as proc:
+        geometry = focus_hyprland(proc, options.timeout) if options.hyprland_focus else None
+        painted, screen = fixture.wait(token + "/raf", options.timeout)
+        _, playback = fixture.wait(token + "/playing", options.timeout, token + "/media-error")
+        before = process_tree(proc.pid)
+        sample_start = time.monotonic()
+        time.sleep(options.seconds)
+        after = process_tree(proc.pid)
+        elapsed = time.monotonic() - sample_start
+        if proc.poll() is not None:
+            raise RuntimeError(f"el navegador terminó con código {proc.returncode}")
+        ticks = sum(value - before.get(pid, 0) for pid, value in after.items())
+        row = {"estado": "frío" if cold else "caliente", "raf_ms": round((painted-start)*1000, 1),
+               "cpu_video": round(100*ticks/os.sysconf("SC_CLK_TCK")/elapsed, 2),
+               "pss_video_mib": memory_mib(after), "viewport_inicial": screen,
+               "viewport_video": playback, "ventana": geometry}
+        fixture.mark(token + "/start-scroll")
+        try:
+            _, scroll = fixture.wait(token + "/scroll-result", options.timeout)
+        except TimeoutError as error:
+            row["error_scroll"] = str(error)
+        else:
+            row["scroll_raf_ms"] = scroll["intervals"]
+            values = sorted(scroll["intervals"])
+            if values:
+                row["scroll_raf_p95_ms"] = round(values[(95 * len(values) + 99) // 100 - 1], 2)
+            else:
+                row["error_scroll"] = "desplazamiento sin intervalos"
+        return row
+
+
+def measure_tabs(fixture, options, name, executable, profile, label, count):
+    paths = ["/tabs/" + uuid.uuid4().hex for _ in range(count)]
+    urls = [f"http://127.0.0.1:{fixture.server_port}{path}" for path in paths]
+    args, env = launch(name, executable, profile, urls)
+    with browser(args, env, options.output / f"{label}.log") as proc:
+        if options.hyprland_focus:
+            focus_hyprland(proc, options.timeout)
+        deadline = time.monotonic() + options.timeout
+        for path in paths:
+            fixture.wait(path + "/loaded", max(0, deadline - time.monotonic()))
+        time.sleep(options.seconds)
+        return {"pss_mib": memory_mib(process_tree(proc.pid))}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--chrome", required=True)
+    parser.add_argument("--brave", required=True)
+    parser.add_argument("--navegador", required=True)
+    parser.add_argument("--hyprland-focus", action="store_true", help="enfoca las ventanas de prueba en Hyprland")
+    parser.add_argument("--qt", help="añade el prototipo Qt como candidato")
+    parser.add_argument("--video", required=True, type=Path, help="WebM local para el bucle de video")
+    parser.add_argument("--rounds", default=5, type=int)
+    parser.add_argument("--seconds", default=4, type=float)
+    parser.add_argument("--memory-tabs", action="store_true", help="mide memoria de una y diez pestañas de texto en cada ronda")
+    parser.add_argument("--timeout", default=25, type=float)
+    parser.add_argument("--output", required=True, type=Path)
+    args = parser.parse_args()
+    if args.rounds < 1 or args.seconds <= 0 or args.timeout <= 0:
+        parser.error("rondas y tiempos deben ser positivos")
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        parser.error("ejecuta desde una sesión Wayland de prueba")
+    apps = [("Chrome", args.chrome), ("Brave", args.brave), ("Navegador", args.navegador)]
+    if args.qt:
+        apps.append(("Qt", args.qt))
+    args.output.mkdir(parents=True, exist_ok=True)
+    fixture = Fixture(args.video.read_bytes())
+    worker = threading.Thread(target=fixture.serve_forever, daemon=True)
+    worker.start()
+    rows = []
+    try:
+        with (args.output / "muestras.jsonl").open("w", encoding="utf-8") as raw:
+            for i in range(args.rounds):
+                rotation = i % len(apps)
+                for name, executable in apps[rotation:] + apps[:rotation]:
+                    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+                        for cold in (True, False):
+                            label = f"{i+1}-{name}-{'frio' if cold else 'caliente'}"
+                            row = {"ronda": i+1, "navegador": name, "muestra": label}
+                            try:
+                                row.update(measure(fixture, args, name, executable, Path(tmp), label, cold))
+                            except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                                row["error"] = str(error)
+                            rows.append(row)
+                            print(json.dumps(row, ensure_ascii=False), file=raw, flush=True)
+                    if args.memory_tabs:
+                        for count in ((1, 10) if i % 2 == 0 else (10, 1)):
+                            label = f"{i+1}-{name}-{count}-tabs"
+                            row = {"ronda": i+1, "navegador": name, "muestra": label, "tabs": count}
+                            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+                                try:
+                                    row.update(measure_tabs(fixture, args, name, executable,
+                                                            Path(tmp), label, count))
+                                except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                                    row["error"] = str(error)
+                            rows.append(row)
+                            print(json.dumps(row, ensure_ascii=False), file=raw, flush=True)
+    finally:
+        fixture.shutdown()
+        fixture.server_close()
+    grouped = defaultdict(list)
+    memory_groups = defaultdict(list)
+    for row in rows:
+        if "pss_mib" in row:
+            memory_groups[(row["navegador"], row["tabs"])].append(row["pss_mib"])
+        elif "error" not in row:
+            grouped[(row["navegador"], row["estado"])].append(row)
+    for (name, state), samples in grouped.items():
+        medians = {metric: statistics.median(sample[metric] for sample in samples)
+                   for metric in ("raf_ms", "cpu_video", "pss_video_mib")}
+        print(json.dumps({"navegador": name, "estado": state, "n": len(samples), **medians},
+                         ensure_ascii=False))
+    for (name, count), samples in memory_groups.items():
+        print(json.dumps({"navegador": name, "tabs": count, "n": len(samples),
+                          "pss_mib": statistics.median(samples)}, ensure_ascii=False))
+    return int(any("error" in row or "error_scroll" in row for row in rows))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

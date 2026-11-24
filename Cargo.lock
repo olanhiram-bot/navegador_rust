@@ -1830,6 +1830,7 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "tempfile",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-tungstenite",
 ]
@@ -5982,7 +5983,6 @@ dependencies = [
  "card",
  "eframe",
  "engine-cdp",
- "image",
  "navegador",
  "receipt",
  "serde",
@@ -5992,6 +5992,8 @@ dependencies = [
  "tokio",
  "url",
  "webbrowser",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -5999,6 +6001,7 @@ name = "shell-gpui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel 2.5.0",
  "card",
  "engine-cdp",
  "gpui",

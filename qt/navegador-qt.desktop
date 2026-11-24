@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Navegador Qt (experimental)
+Comment=Vista nativa experimental de Navegador
+Icon=navegador
+Exec=navegador-qt %u
+Terminal=false
+Categories=Network;WebBrowser;
+StartupNotify=true

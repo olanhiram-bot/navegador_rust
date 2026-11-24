@@ -5,16 +5,19 @@
 //! sitio, búsqueda en página, historial, marcadores, descargas, permisos y
 //! ajustes persistentes.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use engine_cdp::DownloadState;
 use gpui::{
     App, Application, Bounds, ClipboardItem, Context, FocusHandle, KeyDownEvent, MouseButton,
-    MouseDownEvent, ObjectFit, Point, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString,
-    Window, WindowBounds, WindowOptions, div, img, prelude::*, px, rgb, size,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, Point, RenderImage, ScrollDelta,
+    ScrollWheelEvent, SharedString, Window, WindowBounds, WindowOptions, div, img, prelude::*, px,
+    rgb, size,
 };
 use shell::engine::{EngineHandle, Event, Options, TabId, TabInfo, spawn_with_options};
 use shell::estado;
@@ -43,10 +46,8 @@ enum Panel {
 struct DownloadItem {
     id: String,
     name: String,
-    path: PathBuf,
+    path: Option<PathBuf>,
     state: DownloadState,
-    received: u64,
-    total: u64,
 }
 
 struct Shell {
@@ -60,7 +61,10 @@ struct Shell {
     frame: Option<Arc<RenderImage>>,
     previous_frame: Option<Arc<RenderImage>>,
     css: (f32, f32),
-    page_size: (f32, f32),
+    page_bounds: Rc<Cell<Bounds<gpui::Pixels>>>,
+    selection_origin: Option<(TabId, Point<gpui::Pixels>)>,
+    selection_updated: Option<Instant>,
+    pointer_moved: Option<Instant>,
     last_viewport: (u32, u32, f64),
     pending: Option<(String, card::CardView)>,
     result: Option<String>,
@@ -88,22 +92,23 @@ struct Shell {
     show_context: bool,
     menu_open: bool,
     window_active: Option<bool>,
-    screencast_running: bool,
 }
 
 impl Shell {
-    fn new(cx: &mut Context<Self>, initial_urls: Vec<String>, paths: estado::Paths) -> Self {
-        let profile = estado::data_dir().map(|dir| dir.join("perfil"));
-        let log_path = estado::state_dir()
-            .map(|dir| dir.join("recibos.jsonl"))
-            .unwrap_or_else(|| PathBuf::from("navegador-recibos.jsonl"));
-        let options = Options {
-            initial_urls: initial_urls.clone(),
-            log_path,
-            profile,
-            downloads: estado::downloads_dir(),
-        };
-        let handle = spawn_with_options(options, Arc::new(|| {}));
+    fn new(
+        cx: &mut Context<Self>,
+        window: &mut Window,
+        options: Options,
+        paths: estado::Paths,
+    ) -> Self {
+        let address = options.initial_urls.last().cloned().unwrap_or_default();
+        let (wake, changed) = async_channel::bounded(1);
+        let handle = spawn_with_options(
+            options,
+            Arc::new(move || {
+                let _ = wake.try_send(());
+            }),
+        );
         let focus = cx.focus_handle();
 
         let settings = paths
@@ -116,21 +121,22 @@ impl Shell {
             .as_deref()
             .map(|path| estado::load_history(path, 500))
             .unwrap_or_default();
-        let address = initial_urls
-            .last()
-            .cloned()
-            .unwrap_or_else(|| "about:blank".into());
+
+        cx.observe_window_activation(window, |shell, window, _| {
+            let active = window.is_window_active();
+            if shell.window_active != Some(active) {
+                if shell.window_active == Some(true) || active {
+                    shell.handle.screencast(active);
+                }
+                shell.window_active = Some(active);
+                shell.selection_origin = None;
+            }
+        })
+        .detach();
 
         cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(12))
-                    .await;
-                let alive = this.update(cx, |shell, cx| {
-                    shell.drain(cx);
-                    cx.notify();
-                });
-                if alive.is_err() {
+            while changed.recv().await.is_ok() {
+                if this.update(cx, |shell, cx| shell.drain(cx)).is_err() {
                     break;
                 }
             }
@@ -148,7 +154,10 @@ impl Shell {
             frame: None,
             previous_frame: None,
             css: (1.0, 1.0),
-            page_size: (1.0, 1.0),
+            page_bounds: Rc::new(Cell::new(Bounds::default())),
+            selection_origin: None,
+            selection_updated: None,
+            pointer_moved: None,
             last_viewport: (0, 0, 0.0),
             pending: None,
             result: None,
@@ -173,12 +182,14 @@ impl Shell {
             show_context: false,
             menu_open: false,
             window_active: None,
-            screencast_running: true,
         }
     }
 
     fn drain(&mut self, cx: &mut Context<Self>) {
+        let mut changed = false;
+        let mut newest_frame = None;
         while let Ok(event) = self.handle.events.try_recv() {
+            changed = true;
             match event {
                 Event::TabOpened(info) => {
                     if !self.tabs.iter().any(|tab| tab.id == info.id) {
@@ -201,11 +212,18 @@ impl Shell {
                 }
                 Event::Selected(active) => {
                     self.active = active;
-                    self.frame = None;
+                    self.previous_frame = self.frame.take();
+                    self.selection_origin = None;
+                    self.pending = None;
+                    self.result = None;
+                    self.last_viewport = (0, 0, 0.0);
+                    newest_frame = None;
                     if let Some(tab) =
                         active.and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
                     {
-                        self.address = tab.url.clone();
+                        if self.field != Field::Address {
+                            self.address = tab.url.clone();
+                        }
                         self.status = format!("{} · {} elementos", tab.title, tab.elements);
                     } else {
                         self.status = "sin pestañas".into();
@@ -237,15 +255,7 @@ impl Shell {
                 }
                 Event::Frame { tab, frame } => {
                     if Some(tab) == self.active {
-                        self.css = (frame.css_width as f32, frame.css_height as f32);
-                        if let Some(image) = image::RgbaImage::from_raw(
-                            frame.width as u32,
-                            frame.height as u32,
-                            frame.rgba,
-                        ) {
-                            let render = RenderImage::new(vec![image::Frame::new(image)]);
-                            self.previous_frame = self.frame.replace(Arc::new(render));
-                        }
+                        newest_frame = Some(frame);
                     }
                 }
                 Event::Act { tab, outcome } => {
@@ -290,30 +300,25 @@ impl Shell {
                         .find(|item| item.id == download.id)
                     {
                         item.state = download.state;
-                        if let DownloadState::Progress { received, total } = download.state {
-                            item.received = received;
-                            item.total = total;
-                        }
+                        item.path = download.path.clone();
                     } else {
                         self.downloads.push(DownloadItem {
                             id: download.id.clone(),
                             name: download.name.clone(),
                             path: download.path.clone(),
                             state: download.state,
-                            received: 0,
-                            total: 0,
                         });
                     }
                     self.status = match download.state {
                         DownloadState::Started => format!("descargando «{}»…", download.name),
                         DownloadState::Done => {
-                            format!("descarga completa: {}", download.path.display())
+                            format!("descarga completa: {}", download.name)
                         }
                         DownloadState::Canceled => format!("descarga cancelada: {}", download.name),
                         DownloadState::Progress { .. } => self.status.clone(),
                     };
                 }
-                Event::CopyText(_, text) => {
+                Event::CopyText(tab, text) if Some(tab) == self.active => {
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
                 }
                 Event::Notice(notice) => self.status = notice,
@@ -322,10 +327,28 @@ impl Shell {
                     self.handoff = Some(report);
                     self.agent_open = true;
                 }
-                Event::Receipts { .. } => {}
+                Event::Receipts { .. } | Event::CopyText(..) => {}
             }
         }
-        self.persist_session();
+        if let Some(mut frame) = newest_frame {
+            self.css = (frame.css_width as f32, frame.css_height as f32);
+            // RenderImage usa BGRA, mientras que el motor entrega RGBA.
+            for pixel in frame.rgba.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+            if let Some(image) =
+                image::RgbaImage::from_raw(frame.width as u32, frame.height as u32, frame.rgba)
+            {
+                let render = RenderImage::new(vec![image::Frame::new(image)]);
+                if let Some(old) = self.frame.replace(Arc::new(render)) {
+                    self.previous_frame = Some(old);
+                }
+            }
+        }
+        if changed {
+            self.persist_session();
+            cx.notify();
+        }
     }
 
     fn active_url(&self) -> String {
@@ -387,21 +410,21 @@ impl Shell {
         let Some(path) = self.paths.session.clone() else {
             return;
         };
-        if self.tabs.iter().any(|tab| !estado::is_restorable(&tab.url)) {
-            return;
-        }
-        let tabs: Vec<estado::TabState> = self
+        let mut tabs = Vec::new();
+        let mut active = 0;
+        for tab in self
             .tabs
             .iter()
-            .map(|tab| estado::TabState {
+            .filter(|tab| estado::is_restorable(&tab.url))
+        {
+            if self.active == Some(tab.id) {
+                active = tabs.len();
+            }
+            tabs.push(estado::TabState {
                 url: tab.url.clone(),
                 title: tab.title.clone(),
-            })
-            .collect();
-        let active = self
-            .active
-            .and_then(|id| self.tabs.iter().position(|tab| tab.id == id))
-            .unwrap_or(0);
+            });
+        }
         let state = estado::SessionState { tabs, active };
         if state.tabs.is_empty() || self.last_saved.as_ref() == Some(&state) {
             return;
@@ -496,34 +519,92 @@ impl Shell {
     }
 
     fn page_css(&self, position: Point<gpui::Pixels>) -> (f64, f64) {
-        let (w, h) = self.page_size;
-        let x = (f32::from(position.x) / w) as f64 * self.css.0 as f64;
-        let y = ((f32::from(position.y) - TAB_BAR - TOOLBAR) / h) as f64 * self.css.1 as f64;
+        let bounds = self.page_bounds.get();
+        let point = position - bounds.origin;
+        let w = f32::from(bounds.size.width).max(1.0);
+        let h = f32::from(bounds.size.height).max(1.0);
+        let x = f64::from(f32::from(point.x) / w * self.css.0);
+        let y = f64::from(f32::from(point.y) / h * self.css.1);
         (x, y)
     }
 
-    fn page_click(&mut self, event: &MouseDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn page_press(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.field = Field::None;
         self.menu_open = false;
         self.show_context = false;
-        if self.pending.is_some() {
-            cx.notify();
+        window.focus(&self.focus);
+        self.selection_updated = None;
+        self.selection_origin = self
+            .active
+            .filter(|_| self.can_interact())
+            .map(|tab| (tab, event.position));
+        cx.notify();
+    }
+
+    fn can_interact(&self) -> bool {
+        self.frame.is_some()
+            && self.pending.is_none()
+            && self.result.is_none()
+            && self.panel == Panel::None
+    }
+
+    fn page_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, _: &mut Context<Self>) {
+        if event.pressed_button.is_none()
+            && let Some(tab) = self.active
+            && self.can_interact()
+            && self
+                .pointer_moved
+                .is_none_or(|last| last.elapsed() >= Duration::from_millis(32))
+        {
+            self.pointer_moved = Some(Instant::now());
+            let (x, y) = self.page_css(event.position);
+            self.handle.move_mouse(tab, x, y);
+        }
+        if let Some((tab, start)) = self.selection_origin
+            && self.active == Some(tab)
+            && self.can_interact()
+            && event.pressed_button == Some(MouseButton::Left)
+        {
+            let delta = event.position - start;
+            let dragged = self.selection_updated.is_some()
+                || f32::from(delta.x).abs() > 4.0
+                || f32::from(delta.y).abs() > 4.0;
+            if dragged
+                && self
+                    .selection_updated
+                    .is_none_or(|last| last.elapsed() >= Duration::from_millis(32))
+            {
+                self.selection_updated = Some(Instant::now());
+                self.handle.select_text(
+                    tab,
+                    self.page_css(start).into(),
+                    self.page_css(event.position).into(),
+                );
+            }
+        }
+    }
+
+    fn page_release(&mut self, event: &MouseUpEvent, _window: &mut Window, _: &mut Context<Self>) {
+        let Some((tab, start)) = self.selection_origin.take() else {
+            return;
+        };
+        if self.active != Some(tab) || !self.can_interact() {
             return;
         }
         let (x, y) = self.page_css(event.position);
-        if std::env::var_os("NAVEGADOR_CLICK_LOG").is_some() {
-            eprintln!(
-                "clic ventana=({:.0},{:.0}) css=({x:.1},{y:.1}) pagina={:?} css_size={:?}",
-                f32::from(event.position.x),
-                f32::from(event.position.y),
-                self.page_size,
-                self.css
-            );
+        let delta = event.position - start;
+        if self.selection_updated.is_some()
+            || f32::from(delta.x).abs() > 4.0
+            || f32::from(delta.y).abs() > 4.0
+        {
+            self.handle
+                .select_text(tab, self.page_css(start).into(), [x, y]);
+        } else if x >= 0.0 && y >= 0.0 && x < f64::from(self.css.0) && y < f64::from(self.css.1) {
+            if std::env::var_os("NAVEGADOR_CLICK_LOG").is_some() {
+                eprintln!("clic css=({x:.1},{y:.1}) viewport={:?}", self.css);
+            }
+            self.handle.click_in_tab(tab, x, y);
         }
-        if x >= 0.0 && y >= 0.0 {
-            self.handle.click(x, y);
-        }
-        cx.notify();
     }
 
     fn page_middle(
@@ -532,7 +613,7 @@ impl Shell {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.pending.is_some() {
+        if !self.can_interact() {
             return;
         }
         let (x, y) = self.page_css(event.position);
@@ -556,6 +637,9 @@ impl Shell {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.can_interact() {
+            return;
+        }
         let (x, y) = self.page_css(event.position);
         let delta = match event.delta {
             ScrollDelta::Pixels(point) => f32::from(point.y),
@@ -571,6 +655,20 @@ impl Shell {
         let shift = keystroke.modifiers.shift;
         let key = keystroke.key.as_str();
 
+        if keystroke.modifiers.alt && !control {
+            match key {
+                "left" => {
+                    self.handle.back();
+                    return;
+                }
+                "right" => {
+                    self.handle.forward();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         if control {
             match (key, shift) {
                 ("l", _) => {
@@ -581,7 +679,10 @@ impl Shell {
                     return;
                 }
                 ("t", false) => {
+                    self.field = Field::Address;
+                    self.address.clear();
                     self.handle.new_tab(None);
+                    cx.notify();
                     return;
                 }
                 ("t", true) => {
@@ -770,6 +871,23 @@ impl Shell {
             return;
         }
 
+        if control {
+            match key {
+                "c" => {
+                    if let Some(tab) = self.active {
+                        self.handle.copy_text(tab);
+                    }
+                    return;
+                }
+                "v" => {
+                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                        self.handle.insert_text(text);
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
         if let Some(text) = &keystroke.key_char
             && !control
             && !keystroke.modifiers.alt
@@ -844,9 +962,9 @@ impl Shell {
 
 fn nav_button(
     cx: &mut Context<Shell>,
-    id: &'static str,
+    id: impl Into<gpui::ElementId>,
     label: &'static str,
-    action: fn(&mut Shell),
+    action: impl Fn(&mut Shell) + 'static,
 ) -> impl IntoElement {
     div()
         .id(id)
@@ -914,30 +1032,9 @@ impl Render for Shell {
             let _ = cx.drop_image(old, Some(window));
         }
 
-        // Sin foco no se transmite la página: evita gastar CPU y batería con
-        // una ventana que el usuario no está mirando.
-        let active = window.is_window_active();
-        match (self.window_active, active) {
-            // Solo se pausa tras haber estado activa: al arrancar, un falso
-            // «sin foco» dejaría la página congelada.
-            (Some(true), false) => {
-                self.window_active = Some(false);
-                self.screencast_running = false;
-                self.handle.screencast(false);
-            }
-            (Some(false), true) => {
-                self.window_active = Some(true);
-                self.screencast_running = true;
-                self.handle.screencast(true);
-            }
-            (None, _) => self.window_active = Some(active),
-            _ => {}
-        }
-
         let viewport = window.viewport_size();
-        let page_w = f32::from(viewport.width).max(320.0);
-        let page_h = (f32::from(viewport.height) - TAB_BAR - TOOLBAR - STATUS).max(240.0);
-        self.page_size = (page_w, page_h);
+        let page_w = f32::from(viewport.width).max(1.0);
+        let page_h = (f32::from(viewport.height) - TAB_BAR - TOOLBAR - STATUS).max(1.0);
         let zoom = self.zoom_for(&self.active_url()).max(0.5);
         let css_w = (page_w / zoom).max(320.0);
         let css_h = (page_h / zoom).max(240.0);
@@ -970,6 +1067,7 @@ impl Render for Shell {
 
         let tab_strip = div()
             .h(px(TAB_BAR))
+            .flex_shrink_0()
             .w_full()
             .flex()
             .items_center()
@@ -1035,6 +1133,7 @@ impl Render for Shell {
 
         let toolbar = div()
             .h(px(TOOLBAR))
+            .flex_shrink_0()
             .w_full()
             .flex()
             .items_center()
@@ -1053,6 +1152,7 @@ impl Render for Shell {
             .child(
                 div()
                     .flex_1()
+                    .min_w_0()
                     .h(px(30.))
                     .px_3()
                     .flex()
@@ -1068,11 +1168,12 @@ impl Render for Shell {
                         shell.menu_open = false;
                         cx.notify();
                     }))
-                    .child(address),
+                    .child(div().w_full().truncate().child(address)),
             )
             .child(
                 div()
                     .id("menu")
+                    .flex_shrink_0()
                     .w(px(30.))
                     .h(px(26.))
                     .flex()
@@ -1091,14 +1192,28 @@ impl Render for Shell {
 
         let loading = self.frame.is_none();
         let zoom_label = format!("{}%", (zoom * 100.0).round() as i32);
+        let page_bounds = self.page_bounds.clone();
         let mut page = div()
+            .on_children_prepainted(move |children, _, _| {
+                if let Some(bounds) = children.first() {
+                    page_bounds.set(*bounds);
+                }
+            })
             .relative()
             .flex_1()
             .w_full()
             .bg(rgb(0x0c0d0f))
             .overflow_hidden()
             .id("pagina")
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::page_click))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::page_press))
+            .on_mouse_move(cx.listener(Self::page_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::page_release))
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|shell, _, _, _| {
+                    shell.selection_origin = None;
+                }),
+            )
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::page_middle))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::page_right))
             .on_scroll_wheel(cx.listener(Self::page_wheel));
@@ -1119,6 +1234,7 @@ impl Render for Shell {
 
         let status_bar = div()
             .h(px(STATUS))
+            .flex_shrink_0()
             .w_full()
             .flex()
             .items_center()
@@ -1565,31 +1681,67 @@ impl Render for Shell {
                     }
                     content = content.children(self.downloads.iter().map(|item| {
                         let name = item.name.clone();
-                        let path = item.path.clone();
                         let detail = match item.state {
-                            DownloadState::Done => "completada · pulsa para abrir".to_string(),
+                            DownloadState::Done => "completada".to_string(),
                             DownloadState::Canceled => "cancelada".to_string(),
                             DownloadState::Started => "empezando…".to_string(),
-                            DownloadState::Progress { .. } => {
-                                if item.total > 0 {
-                                    format!("{} %", (item.received * 100 / item.total).min(100))
+                            DownloadState::Progress { received, total } => {
+                                if total > 0 {
+                                    format!("{} %", (received.saturating_mul(100) / total).min(100))
                                 } else {
-                                    "descargando…".into()
+                                    format!("{} KiB recibidos", received / 1024)
                                 }
                             }
                         };
-                        div()
+                        let mut row = div()
                             .id(SharedString::from(format!("dl-{}", item.id)))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
                             .px_2()
                             .py_1()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .hover(|style| style.bg(rgb(0x333641)))
-                            .on_click(cx.listener(move |_, _: &gpui::ClickEvent, _, _| {
-                                let _ = webbrowser::open(&path.to_string_lossy());
-                            }))
-                            .child(div().text_color(rgb(0xe6e8ef)).child(name))
-                            .child(div().text_color(rgb(0x9aa0ad)).child(detail))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .child(name)
+                                    .child(div().text_color(rgb(0x9aa0ad)).child(detail)),
+                            );
+                        if let Some(path) = item.path.clone() {
+                            row = row.child(nav_button(
+                                cx,
+                                SharedString::from(format!("open-{}", item.id)),
+                                "Abrir",
+                                move |_| {
+                                    let _ = webbrowser::open(&path.to_string_lossy());
+                                },
+                            ));
+                        } else if matches!(
+                            item.state,
+                            DownloadState::Started | DownloadState::Progress { .. }
+                        ) {
+                            let id = item.id.clone();
+                            row = row.child(nav_button(
+                                cx,
+                                SharedString::from(format!("cancel-{id}")),
+                                "Cancelar",
+                                move |shell| {
+                                    shell.handle.cancel_download(id.clone());
+                                },
+                            ));
+                        } else if item.state == DownloadState::Done
+                            && let Some(dir) = estado::downloads_dir()
+                        {
+                            row = row.child(nav_button(
+                                cx,
+                                SharedString::from(format!("folder-{}", item.id)),
+                                "Carpeta",
+                                move |_| {
+                                    let _ = webbrowser::open(&dir.to_string_lossy());
+                                },
+                            ));
+                        }
+                        row
                     }));
                 }
                 Panel::None => {}
@@ -1825,29 +1977,20 @@ fn main() {
         println!("navegador-gpui {}", env!("CARGO_PKG_VERSION"));
         return;
     }
-    let cli_url = args
-        .into_iter()
-        .find(|arg| !arg.starts_with("--"))
-        .map(|url| shell::app::browser_url(&url));
-
-    let paths = estado::Paths {
-        session: estado::session_path(),
-        settings: estado::settings_path(),
-        history: estado::history_path(),
-    };
-    let initial_urls = match cli_url {
-        Some(url) => vec![url],
-        None => paths
-            .session
-            .as_deref()
-            .and_then(estado::load)
-            .map(|state| state.ordered_urls())
-            .unwrap_or_else(|| vec!["about:blank".to_string()]),
-    };
+    let default_log = estado::state_dir()
+        .map(|dir| dir.join("recibos.jsonl"))
+        .unwrap_or_else(|| PathBuf::from("navegador-recibos.jsonl"));
+    let startup =
+        shell::startup::Startup::parse(args.into_iter(), default_log).unwrap_or_else(|error| {
+            eprintln!("{error}");
+            std::process::exit(2);
+        });
+    let options = startup.options.clone();
+    let paths = startup.paths.clone();
 
     Application::new().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1100.), px(780.)), cx);
-        let urls = initial_urls.clone();
+        let options = options.clone();
         let paths = paths.clone();
         cx.open_window(
             WindowOptions {
@@ -1859,7 +2002,7 @@ fn main() {
                 app_id: Some("navegador".into()),
                 ..Default::default()
             },
-            move |_, cx| cx.new(|cx| Shell::new(cx, urls.clone(), paths.clone())),
+            move |window, cx| cx.new(|cx| Shell::new(cx, window, options, paths)),
         )
         .expect("no se pudo abrir la ventana");
         cx.activate(true);

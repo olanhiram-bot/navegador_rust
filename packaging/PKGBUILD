@@ -6,8 +6,8 @@ pkgdesc="Navegador local y auditable: la persona y el agente comparten la misma 
 arch=('x86_64' 'aarch64')
 url="https://github.com/olanhiram-bot/navegador_rust"
 license=('Apache-2.0')
-depends=('chromium' 'xorg-server-xvfb')
-makedepends=('cargo' 'git')
+depends=('chromium' 'xorg-server-xvfb' 'vulkan-icd-loader' 'vulkan-driver' 'libxkbcommon-x11' 'xdg-utils')
+makedepends=('cargo' 'git' 'pkgconf' 'wayland' 'libx11' 'libxcursor' 'libxrandr' 'libxi' 'libglvnd')
 provides=('navegador')
 conflicts=('navegador')
 options=('!lto')
@@ -16,12 +16,13 @@ sha256sums=('SKIP')
 
 build() {
   cd "$srcdir/navegador_rust"
-  cargo build --release --locked -p shell-gpui
+  cargo build --release --locked -p shell-gpui -p navegador
 }
 
 package() {
   cd "$srcdir/navegador_rust"
   install -Dm755 target/release/navegador-gpui "$pkgdir/usr/bin/navegador-shell"
+  install -Dm755 target/release/navegador "$pkgdir/usr/bin/navegador"
   install -Dm644 packaging/navegador.desktop \
     "$pkgdir/usr/share/applications/navegador.desktop"
   install -Dm644 packaging/navegador.svg \

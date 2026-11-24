@@ -399,8 +399,9 @@ impl<E: Engine> Session<E> {
 
         match &decision {
             Decision::Deny { reasons }
-                if reasons
-                    == &vec!["no se pudo resolver el origen real de la acción".to_string()] =>
+                if options.approved_hash.is_none()
+                    && reasons.as_slice()
+                        == ["no se pudo resolver el origen real de la acción"] =>
             {
                 // Un botón que solo ejecuta JavaScript no declara destino; se
                 // pulsa como interacción local. Si dispara red, no hay tarjeta.
@@ -539,9 +540,12 @@ impl<E: Engine + Transport> Session<E> {
         width: u32,
         height: u32,
         scale: f64,
-    ) -> Result<(), SessionError> {
-        self.engine.set_viewport(width, height, scale).await?;
-        Ok(())
+    ) -> Result<Option<String>, SessionError> {
+        Ok(self.engine.set_viewport(width, height, scale).await?)
+    }
+
+    pub async fn move_mouse(&self, x: f64, y: f64) -> Result<(), SessionError> {
+        Ok(self.engine.move_mouse(x, y).await?)
     }
 
     pub async fn history(&mut self, delta: i64) -> Result<bool, SessionError> {
@@ -626,17 +630,16 @@ impl<E: Engine + Transport> Session<E> {
         Ok(self.engine.link_href(&selector).await?)
     }
 
-    /// Elemento accionable bajo un punto, solo si sigue en el snapshot vivo.
+    /// Busca el control vivo y actualiza el snapshot si apareció después de cargar la página.
     pub async fn element_at(&mut self, x: f64, y: f64) -> Result<Option<ElementRef>, SessionError> {
         let Some(selector) = self.engine.hit_test(x, y).await? else {
             return Ok(None);
         };
-        let snapshot = self.snapshot.as_ref().ok_or(SessionError::NoSnapshot)?;
-        Ok(snapshot
-            .elements
-            .iter()
-            .find(|element| element.selector == selector)
-            .cloned())
+        if let Some(element) = self.reference_for_selector(&selector) {
+            return Ok(Some(element.clone()));
+        }
+        self.snapshot().await?;
+        Ok(self.reference_for_selector(&selector).cloned())
     }
 }
 

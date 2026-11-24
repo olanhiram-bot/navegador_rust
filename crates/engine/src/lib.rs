@@ -143,13 +143,17 @@ pub trait Transport {
         session_id: i64,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
 
-    /// Ajusta el viewport de la página al área visible de la shell.
+    /// Ajusta el viewport y devuelve una captura JPEG en base64 si está disponible.
     fn set_viewport(
         &mut self,
         width: u32,
         height: u32,
         scale: f64,
-    ) -> impl Future<Output = anyhow::Result<()>> + Send;
+    ) -> impl Future<Output = anyhow::Result<Option<String>>> + Send;
+
+    fn move_mouse(&self, _x: f64, _y: f64) -> impl Future<Output = anyhow::Result<()>> + Send {
+        async { Ok(()) }
+    }
 
     /// Atrás (`-1`), adelante (`1`). `false` si no hay historial en esa dirección.
     fn history(&mut self, delta: i64) -> impl Future<Output = anyhow::Result<bool>> + Send;

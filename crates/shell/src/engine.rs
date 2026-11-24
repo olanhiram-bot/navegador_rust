@@ -110,9 +110,11 @@ pub enum Command {
         y: f64,
         delta_y: f64,
     },
+    MoveMouse(TabId, f64, f64),
     SelectText(TabId, [f64; 2], [f64; 2]),
     CopyText(TabId),
     Click {
+        tab: Option<TabId>,
         x: f64,
         y: f64,
     },
@@ -147,6 +149,7 @@ pub enum Command {
         denied: Vec<String>,
     },
     Screencast(bool),
+    CancelDownload(String),
     Shutdown,
 }
 
@@ -220,6 +223,10 @@ impl EngineHandle {
         let _ = self.commands.send(Command::Wheel { x, y, delta_y });
     }
 
+    pub fn move_mouse(&self, tab: TabId, x: f64, y: f64) {
+        let _ = self.commands.send(Command::MoveMouse(tab, x, y));
+    }
+
     pub fn select_text(&self, tab: TabId, start: [f64; 2], end: [f64; 2]) {
         let _ = self.commands.send(Command::SelectText(tab, start, end));
     }
@@ -229,7 +236,15 @@ impl EngineHandle {
     }
 
     pub fn click(&self, x: f64, y: f64) {
-        let _ = self.commands.send(Command::Click { x, y });
+        let _ = self.commands.send(Command::Click { tab: None, x, y });
+    }
+
+    pub fn click_in_tab(&self, tab: TabId, x: f64, y: f64) {
+        let _ = self.commands.send(Command::Click {
+            tab: Some(tab),
+            x,
+            y,
+        });
     }
 
     pub fn insert_text(&self, text: impl Into<String>) {
@@ -258,6 +273,10 @@ impl EngineHandle {
     }
 
     /// Pausa o reanuda los frames de la pestaña activa (ventana sin foco).
+    pub fn cancel_download(&self, id: String) {
+        let _ = self.commands.send(Command::CancelDownload(id));
+    }
+
     pub fn screencast(&self, running: bool) {
         let _ = self.commands.send(Command::Screencast(running));
     }
@@ -317,6 +336,7 @@ pub fn spawn(initial_url: String, log_path: PathBuf) -> EngineHandle {
 }
 
 /// Arranque del motor con perfil persistente o efímero y varias pestañas.
+#[derive(Clone)]
 pub struct Options {
     pub initial_urls: Vec<String>,
     pub log_path: PathBuf,
@@ -374,6 +394,7 @@ struct Pending {
 
 struct Tab {
     capture_scale: f64,
+    viewport: Option<(u32, u32)>,
     session: Session<Chrome>,
     log_path: PathBuf,
     pending: Option<Pending>,
@@ -430,7 +451,7 @@ fn run(options: Options, mut commands: UnboundedReceiver<Command>, events: Emitt
             match input {
                 EngineInput::Command(None) => return Ok(()),
                 EngineInput::Command(Some(command)) => {
-                    match handle_command(&mut state, command, &events).await {
+                    match handle_command(&mut state, command, &events, &frames).await {
                         Ok(true) => return Ok(()),
                         Ok(false) => {}
                         Err(error) => events.emit(Event::Error(format!("{error:#}"))),
@@ -485,6 +506,11 @@ async fn handle_browser_event(
             let tab = state.tabs.get_mut(&id).expect("pestaña existente");
             if Some(id) == state.active
                 && let Some(frame) = EncodedFrame::from_event(id, tab.capture_scale, &mut event)
+                // Los eventos anteriores al cambio pueden seguir en la cola CDP.
+                && tab.viewport.is_none_or(|(width, height)| {
+                    (frame.css_width - f64::from(width)).abs() <= 2.0
+                        && (frame.css_height - f64::from(height)).abs() <= 2.0
+                })
             {
                 frames.send_replace(Some(Arc::new(frame)));
             }
@@ -580,6 +606,7 @@ async fn adopt_tab(state: &mut State, page: engine_cdp::Page, events: &Emitter) 
         id,
         Tab {
             capture_scale: 1.0,
+            viewport: None,
             session,
             log_path,
             pending: None,
@@ -604,11 +631,18 @@ async fn adopt_tab(state: &mut State, page: engine_cdp::Page, events: &Emitter) 
 }
 
 /// `true` significa cerrar la shell.
-async fn handle_command(state: &mut State, command: Command, events: &Emitter) -> Result<bool> {
+async fn handle_command(
+    state: &mut State,
+    command: Command,
+    events: &Emitter,
+    frames: &watch::Sender<Option<Arc<EncodedFrame>>>,
+) -> Result<bool> {
     match command {
         Command::Shutdown => {
             state.tabs.clear();
-            state.browser = None;
+            if let Some(browser) = state.browser.take() {
+                let _ = tokio::time::timeout(Duration::from_secs(2), browser.close()).await;
+            }
             return Ok(true);
         }
         Command::NewTab { url, background } => {
@@ -631,12 +665,22 @@ async fn handle_command(state: &mut State, command: Command, events: &Emitter) -
             height,
             scale,
         } => {
-            if let Some(tab) = active_tab(state) {
-                tab.session.set_viewport(width, height, scale).await?;
+            if let Some(id) = state.active {
+                let tab = state.tabs.get_mut(&id).expect("pestaña activa");
+                let width = width.max(320);
+                let height = height.max(240);
+                let jpeg = tab.session.set_viewport(width, height, scale).await?;
                 tab.capture_scale = scale.clamp(1.0, 3.0);
-                if tab.pending.is_none()
-                    && let Some(id) = state.active
-                {
+                tab.viewport = Some((width, height));
+                if let Some(jpeg) = jpeg {
+                    frames.send_replace(Some(Arc::new(EncodedFrame {
+                        tab: id,
+                        jpeg,
+                        css_width: f64::from(width),
+                        css_height: f64::from(height),
+                    })));
+                }
+                if tab.pending.is_none() {
                     refresh_snapshot(state, id, events).await?;
                 }
             }
@@ -644,6 +688,11 @@ async fn handle_command(state: &mut State, command: Command, events: &Emitter) -
         Command::Wheel { x, y, delta_y } => {
             if let Some(tab) = active_tab(state) {
                 tab.session.scroll(x, y, delta_y).await?;
+            }
+        }
+        Command::MoveMouse(id, x, y) => {
+            if state.active == Some(id) {
+                state.tabs[&id].session.move_mouse(x, y).await?;
             }
         }
         Command::SelectText(id, start, end) => {
@@ -659,7 +708,11 @@ async fn handle_command(state: &mut State, command: Command, events: &Emitter) -
                 }
             }
         }
-        Command::Click { x, y } => click(state, x, y, events).await?,
+        Command::Click { tab, x, y } => {
+            if tab.is_none() || tab == state.active {
+                click(state, x, y, events).await?;
+            }
+        }
         Command::OpenLinkNewTab { x, y, background } => {
             open_link_new_tab(state, x, y, background, events).await?;
         }
@@ -745,6 +798,14 @@ async fn handle_command(state: &mut State, command: Command, events: &Emitter) -
                 }
             }
         }
+        Command::CancelDownload(id) => {
+            if let Some(browser) = &state.browser {
+                browser
+                    .cancel_download(&id)
+                    .await
+                    .context("cancelar la descarga")?;
+            }
+        }
         Command::Approve { hash } => approve(state, &hash, events).await?,
         Command::Deny => deny(state, events),
         Command::Handoff => handoff(state, events).await,
@@ -795,6 +856,7 @@ async fn open_tab(state: &mut State, url: &str, select: bool, events: &Emitter) 
         id,
         Tab {
             capture_scale: 1.0,
+            viewport: None,
             session,
             log_path,
             pending: None,
@@ -1067,6 +1129,10 @@ async fn click(state: &mut State, x: f64, y: f64, events: &Emitter) -> Result<()
         }
         return Ok(());
     }
+    let use_page_click = tab
+        .session
+        .url()
+        .is_some_and(|url| url.starts_with("https://") || url.starts_with("http://"));
     let element = {
         let Some(tab) = state.tabs.get_mut(&id) else {
             return Ok(());
@@ -1079,6 +1145,10 @@ async fn click(state: &mut State, x: f64, y: f64, events: &Emitter) -> Result<()
         if let Some(href) = tab.session.link_at(x, y).await?
             && (href.starts_with("https://") || href.starts_with("http://"))
         {
+            if use_page_click {
+                tab.session.click_at(x, y).await?;
+                return Ok(());
+            }
             return navigate(state, &href, events).await;
         }
         tab.session.select_text([x, y], [x, y]).await?;
@@ -1088,39 +1158,20 @@ async fn click(state: &mut State, x: f64, y: f64, events: &Emitter) -> Result<()
 
     match element.role.as_str() {
         "button" => {
-            let tab = &state.tabs[&id];
-            if tab
-                .session
-                .url()
-                .is_some_and(|url| url.starts_with("https://www.youtube.com/"))
-                && let Some(query) = tab.session.youtube_search_query(&element.selector).await?
-            {
-                if query.is_empty() {
-                    events.emit(Event::Notice("Escribe lo que quieres buscar".into()));
-                    return Ok(());
-                }
-                let destination = url::Url::parse_with_params(
-                    "https://www.youtube.com/results",
-                    [("search_query", query)],
-                )?;
-                return navigate(state, destination.as_str(), events).await;
+            if youtube_search(state, id, &element.selector, events).await? {
+                return Ok(());
             }
         }
         "link" => {
-            let (href, target) = {
-                let tab = state.tabs.get_mut(&id).expect("pestaña activa");
-                let href = tab.session.link_href(&element.selector).await?;
-                let target = tab.session.link_target(&element.selector).await?;
-                (href, target)
-            };
+            let tab = state.tabs.get_mut(&id).expect("pestaña activa");
+            let href = tab.session.link_href(&element.selector).await?;
             return match href {
                 Some(href) if href.starts_with("http://") || href.starts_with("https://") => {
-                    if target.as_deref() == Some("_blank") {
-                        open_tab(state, &href, true, events).await?;
-                        Ok(())
-                    } else {
-                        navigate(state, &href, events).await
+                    if !use_page_click {
+                        return navigate(state, &href, events).await;
                     }
+                    tab.session.click_at(x, y).await?;
+                    Ok(())
                 }
                 _ => {
                     let _ = events.emit(Event::Notice(format!(
@@ -1133,7 +1184,8 @@ async fn click(state: &mut State, x: f64, y: f64, events: &Emitter) -> Result<()
         }
         // Un click en un campo no ejecuta nada: solo le da el foco para que el
         // teclado reenviado escriba ahí.
-        "textbox" | "searchbox" | "combobox" | "select" => {
+        "textbox" | "searchbox" | "combobox" | "select" | "checkbox" | "radio" | "slider"
+        | "video" => {
             let tab = state.tabs.get_mut(&id).expect("pestaña activa");
             tab.session.click_at(x, y).await?;
             let _ = events.emit(Event::Notice(format!(
@@ -1155,19 +1207,37 @@ async fn click(state: &mut State, x: f64, y: f64, events: &Emitter) -> Result<()
         generation: Some(state.tabs[&id].session.generation()),
         ..ActOptions::default()
     };
-    let outcome = {
-        let tab = state.tabs.get_mut(&id).expect("pestaña activa");
-        match tab.session.act(&element.reference, options.clone()).await {
-            Err(error @ session::SessionError::ElementChanged(_)) => {
-                refresh_snapshot(state, id, events).await?;
-                return Err(error.into());
-            }
-            result => result?,
-        }
-    };
-
-    settle_act(state, id, &element.reference, options, outcome, events).await?;
+    act_on_reference(state, id, &element.reference, options, events).await?;
     Ok(())
+}
+
+async fn youtube_search(
+    state: &mut State,
+    id: TabId,
+    selector: &str,
+    events: &Emitter,
+) -> Result<bool> {
+    let tab = &state.tabs[&id];
+    if !tab
+        .session
+        .url()
+        .is_some_and(|url| url.starts_with("https://www.youtube.com/"))
+    {
+        return Ok(false);
+    }
+    let Some(query) = tab.session.youtube_search_query(selector).await? else {
+        return Ok(false);
+    };
+    if query.is_empty() {
+        events.emit(Event::Notice("Escribe lo que quieres buscar".into()));
+    } else {
+        let destination = url::Url::parse_with_params(
+            "https://www.youtube.com/results",
+            [("search_query", query)],
+        )?;
+        navigate(state, destination.as_str(), events).await?;
+    }
+    Ok(true)
 }
 
 /// Enter en un campo de un formulario equivale a pulsar su botón de envío: pasa
@@ -1176,13 +1246,22 @@ async fn submit_with_enter(state: &mut State, events: &Emitter) -> Result<bool> 
     let Some(id) = state.active else {
         return Ok(false);
     };
+    if youtube_search(state, id, ":focus", events).await? {
+        return Ok(true);
+    }
     let element = {
-        let tab = &state.tabs[&id];
+        let tab = state.tabs.get_mut(&id).expect("pestaña activa");
         let Some(selector) = tab.session.form_submitter().await? else {
             return Ok(false);
         };
+        if tab.session.reference_for_selector(&selector).is_none() {
+            tab.session.snapshot().await?;
+        }
         let Some(element) = tab.session.reference_for_selector(&selector) else {
-            return Ok(false);
+            events.emit(Event::Notice(
+                "El formulario cambió. Vuelve a pulsar Enter para revisarlo.".into(),
+            ));
+            return Ok(true);
         };
         if element.role != "button" || element.disabled {
             return Ok(false);
@@ -1193,17 +1272,7 @@ async fn submit_with_enter(state: &mut State, events: &Emitter) -> Result<bool> 
         generation: Some(state.tabs[&id].session.generation()),
         ..ActOptions::default()
     };
-    let outcome = {
-        let tab = state.tabs.get_mut(&id).expect("pestaña activa");
-        match tab.session.act(&element.reference, options.clone()).await {
-            Err(error @ session::SessionError::ElementChanged(_)) => {
-                refresh_snapshot(state, id, events).await?;
-                return Err(error.into());
-            }
-            result => result?,
-        }
-    };
-    settle_act(state, id, &element.reference, options, outcome, events).await?;
+    act_on_reference(state, id, &element.reference, options, events).await?;
     Ok(true)
 }
 
@@ -1264,21 +1333,42 @@ async fn approve(state: &mut State, hash: &str, events: &Emitter) -> Result<()> 
         return Ok(());
     }
 
-    let outcome = {
-        let tab = state.tabs.get_mut(&id).expect("pestaña activa");
-        tab.session
-            .act(&pending.reference, pending.options.clone())
-            .await?
+    act_on_reference(state, id, &pending.reference, pending.options, events).await
+}
+
+async fn act_on_reference(
+    state: &mut State,
+    id: TabId,
+    reference: &str,
+    options: ActOptions,
+    events: &Emitter,
+) -> Result<()> {
+    use session::SessionError;
+
+    let tab = state.tabs.get_mut(&id).expect("pestaña activa");
+    let outcome = match tab.session.act(reference, options.clone()).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let expired = matches!(
+                error,
+                SessionError::ElementChanged(_)
+                    | SessionError::StaleReference { .. }
+                    | SessionError::UnknownReference(_)
+                    | SessionError::NoSnapshot
+            ) || matches!(&error, SessionError::Engine(source)
+                if source.is::<engine_cdp::ActionUnavailable>());
+            if !expired {
+                return Err(error.into());
+            }
+            tab.pending = None;
+            refresh_snapshot(state, id, events).await?;
+            events.emit(Event::Notice(
+                "La página cambió. Revisa el control y vuelve a pulsarlo para continuar.".into(),
+            ));
+            return Ok(());
+        }
     };
-    settle_act(
-        state,
-        id,
-        &pending.reference,
-        pending.options,
-        outcome,
-        events,
-    )
-    .await
+    settle_act(state, id, reference, options, outcome, events).await
 }
 
 fn deny(state: &mut State, events: &Emitter) {
@@ -1321,7 +1411,9 @@ async fn settle_act(
                 });
             }
         }
-        ActOutcome::Executed { .. } | ActOutcome::NotExecuted { .. } => {
+        ActOutcome::Executed { .. }
+        | ActOutcome::NotExecuted { .. }
+        | ActOutcome::LocalInteraction { .. } => {
             if let Some(tab) = state.tabs.get_mut(&id) {
                 tab.pending = None;
             }
@@ -1379,23 +1471,38 @@ impl EncodedFrame {
             return None;
         };
         let metadata = &params["metadata"];
+        // CDP reports the host surface in DIP. set_viewport separately scales
+        // the emulated page within that surface.
+        let page_scale = metadata["pageScaleFactor"]
+            .as_f64()
+            .filter(|scale| *scale > 0.0)
+            .unwrap_or(1.0);
         Some(Self {
             tab,
             jpeg,
-            css_width: metadata["deviceWidth"].as_f64().unwrap_or(1024.0) / capture_scale,
-            css_height: metadata["deviceHeight"].as_f64().unwrap_or(768.0) / capture_scale,
+            css_width: metadata["deviceWidth"].as_f64()? / (capture_scale * page_scale),
+            css_height: metadata["deviceHeight"].as_f64()? / (capture_scale * page_scale),
         })
     }
 
     fn decode(&self) -> Result<Frame> {
         let bytes = base64::engine::general_purpose::STANDARD.decode(&self.jpeg)?;
-        let rgba =
-            image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg)?.into_rgba8();
-        let (width, height) = rgba.dimensions();
+        // Decodifica a RGBA directamente para evitar una copia del JPEG y
+        // una segunda pasada sobre todos los píxeles.
+        let options = zune_core::options::DecoderOptions::default()
+            .jpeg_set_out_colorspace(zune_core::colorspace::ColorSpace::RGBA);
+        let mut jpeg = zune_jpeg::JpegDecoder::new_with_options(
+            zune_core::bytestream::ZCursor::new(bytes.as_slice()),
+            options,
+        );
+        let rgba = jpeg
+            .decode()
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        let (width, height) = jpeg.dimensions().context("el JPEG no tiene dimensiones")?;
         Ok(Frame {
-            width: width as usize,
-            height: height as usize,
-            rgba: rgba.into_raw(),
+            width,
+            height,
+            rgba,
             css_width: self.css_width,
             css_height: self.css_height,
         })

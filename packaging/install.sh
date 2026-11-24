@@ -13,11 +13,16 @@ for arg in "$@"; do
     *) prefix="$arg" ;;
   esac
 done
+if [[ "$prefix" != /* ]]; then
+  prefix="$PWD/$prefix"
+fi
 here="$(cd "$(dirname "$0")/.." && pwd)"
 
-cargo build --release --locked -p shell-gpui
+cd "$here"
+cargo build --release --locked -p shell-gpui -p navegador
 
-install -Dm755 "$here/target/release/navegador-gpui" "$prefix/bin/navegador-shell"
+install -Dm755 "${CARGO_TARGET_DIR:-$here/target}/release/navegador-gpui" "$prefix/bin/navegador-shell"
+install -Dm755 "${CARGO_TARGET_DIR:-$here/target}/release/navegador" "$prefix/bin/navegador"
 install -Dm644 "$here/packaging/navegador.desktop" \
   "$prefix/share/applications/navegador.desktop"
 install -Dm644 "$here/packaging/navegador.svg" \

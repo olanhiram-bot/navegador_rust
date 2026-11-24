@@ -3,7 +3,7 @@
 //! Cada línea es un `LogEntry` con su `seq` y el hash de la entrada anterior.
 //! Alterar o quitar una línea rompe la cadena y `verify` lo detecta.
 
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
@@ -68,20 +68,27 @@ impl ReceiptLog {
     /// Abre (o crea) el log y verifica lo que ya hubiera.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, LogError> {
         let path = path.into();
-        let mut entries = Vec::new();
-        if path.exists() {
-            let file = std::fs::File::open(&path)?;
-            for line in BufReader::new(file).lines() {
-                let line = line?;
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let entry: LogEntry =
-                    serde_json::from_str(&line).map_err(|e| LogError::Json(e.to_string()))?;
-                entries.push(entry);
-            }
+        match File::open(&path) {
+            Ok(file) => Self::read(path, file),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self {
+                path,
+                entries: Vec::new(),
+            }),
+            Err(error) => Err(error.into()),
         }
-        let log = ReceiptLog { path, entries };
+    }
+
+    fn read(path: PathBuf, file: File) -> Result<Self, LogError> {
+        let mut entries = Vec::new();
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let entry = serde_json::from_str(&line).map_err(|e| LogError::Json(e.to_string()))?;
+            entries.push(entry);
+        }
+        let log = Self { path, entries };
         log.verify()?;
         Ok(log)
     }
@@ -160,6 +167,6 @@ impl ReceiptLog {
 
 /// Verifica un fichero de log sin abrirlo para escritura.
 pub fn verify_file(path: &Path) -> Result<usize, LogError> {
-    let log = ReceiptLog::open(path)?;
+    let log = ReceiptLog::read(path.to_path_buf(), File::open(path)?)?;
     Ok(log.entries().len())
 }

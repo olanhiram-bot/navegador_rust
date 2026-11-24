@@ -4,10 +4,12 @@
 //! navegador audit  <url> <selector> [importe] [destinatario]
 //! navegador run    <url> <selector> [importe] [destinatario] [--yes|--gui] [--key HEX] [--out RUTA]
 //! navegador verify <recibo.json>
+//! navegador verify-log <recibos.jsonl>
 //! navegador keygen
 //! ```
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
@@ -33,6 +35,7 @@ async fn real_main() -> Result<ExitCode> {
         "audit" => audit(&positional).await,
         "run" => run(&positional, &flags).await,
         "verify" => verify(&positional),
+        "verify-log" => verify_log(&positional),
         "keygen" => keygen(),
         other => {
             usage();
@@ -167,6 +170,22 @@ fn verify(positional: &[String]) -> Result<ExitCode> {
     }
 }
 
+fn verify_log(positional: &[String]) -> Result<ExitCode> {
+    let [path] = positional else {
+        bail!("uso: navegador verify-log <recibos.jsonl>");
+    };
+    match receipt::verify_file(Path::new(path)) {
+        Ok(count) => {
+            println!("Cadena válida · {count} recibos");
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(error) => {
+            eprintln!("Cadena no válida: {error}");
+            Ok(ExitCode::from(2))
+        }
+    }
+}
+
 fn keygen() -> Result<ExitCode> {
     let identity = Identity::generate()?;
     println!("semilla (secreto, guárdala): {}", identity.seed_hex());
@@ -246,6 +265,6 @@ fn parse_args() -> Result<(String, Vec<String>, HashMap<String, String>)> {
 
 fn usage() {
     eprintln!(
-        "uso:\n  navegador audit  <url> <selector> [importe] [destinatario]\n  navegador run    <url> <selector> [importe] [destinatario] [--yes|--gui] [--key HEX] [--out RUTA]\n  navegador verify <recibo.json>\n  navegador keygen"
+        "uso:\n  navegador audit  <url> <selector> [importe] [destinatario]\n  navegador run    <url> <selector> [importe] [destinatario] [--yes|--gui] [--key HEX] [--out RUTA]\n  navegador verify <recibo.json>\n  navegador verify-log <recibos.jsonl>\n  navegador keygen"
     );
 }

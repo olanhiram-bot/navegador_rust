@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -89,6 +90,7 @@ impl Page {
 /// pestañas, menos RAM y la posibilidad de reutilizar un perfil persistente.
 pub struct Browser {
     child: Child,
+    closing: AtomicBool,
     profile: Profile,
     /// Candado exclusivo del perfil persistente: dos instancias con el mismo
     /// `--user-data-dir` no pueden coexistir.
@@ -191,6 +193,7 @@ impl Browser {
 
         let mut browser = Browser {
             child,
+            closing: AtomicBool::new(false),
             profile,
             _lock: lock,
             _display: display,
@@ -299,8 +302,6 @@ impl Browser {
         Ok(())
     }
 
-    /// Cierre ordenado: Chromium vuelca cookies e historial al perfil, igual
-    /// que al cerrar una ventana.
     /// Deja que Chromium escriba las descargas en `dir` y avisa de su avance.
     /// Los eventos llegan por una conexión de navegador, no de pestaña: así no
     /// se pierden cuando cambia la página.
@@ -311,14 +312,7 @@ impl Browser {
     ) -> Result<()> {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("no se pudo crear {}", dir.display()))?;
-        let version = http_request(self.port, "GET", "/json/version").await?;
-        let version: Value = serde_json::from_str(&version).context("/json/version no es JSON")?;
-        let ws = version
-            .get("webSocketDebuggerUrl")
-            .and_then(Value::as_str)
-            .context("/json/version sin WebSocket")?
-            .to_string();
-        let mut cdp = Cdp::connect(&ws).await?;
+        let mut cdp = self.browser_cdp().await?;
         cdp.call(
             "Browser.setDownloadBehavior",
             json!({
@@ -331,7 +325,7 @@ impl Browser {
 
         let mut names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         tokio::spawn(async move {
-            while let Ok(Some(event)) = cdp.next_event(Duration::from_secs(3600)).await {
+            while let Some(event) = cdp.recv_event().await {
                 match event["method"].as_str() {
                     Some("Browser.downloadWillBegin") => {
                         let params = &event["params"];
@@ -344,7 +338,7 @@ impl Browser {
                         notify(DownloadEvent {
                             id,
                             name: name.clone(),
-                            path: dir.join(&name),
+                            path: None,
                             state: DownloadState::Started,
                         });
                     }
@@ -362,10 +356,18 @@ impl Browser {
                                 total: params["totalBytes"].as_u64().unwrap_or(0),
                             },
                         };
+                        let path = if state == DownloadState::Done {
+                            params["filePath"].as_str().map(PathBuf::from)
+                        } else {
+                            None
+                        };
+                        if !matches!(state, DownloadState::Progress { .. }) {
+                            names.remove(&id);
+                        }
                         notify(DownloadEvent {
                             id,
-                            name: name.clone(),
-                            path: dir.join(&name),
+                            name,
+                            path,
                             state,
                         });
                     }
@@ -376,16 +378,32 @@ impl Browser {
         Ok(())
     }
 
+    pub async fn cancel_download(&self, id: &str) -> Result<()> {
+        self.browser_cdp()
+            .await?
+            .call("Browser.cancelDownload", json!({ "guid": id }))
+            .await?;
+        Ok(())
+    }
+
+    /// Cierre ordenado: Chromium vuelca cookies e historial al perfil.
     pub async fn close(&self) -> Result<()> {
+        let cdp = self.browser_cdp().await?;
+        self.closing.store(true, Ordering::Relaxed);
+        // Chromium puede cerrar el WebSocket antes de contestar a Browser.close.
+        let _ = tokio::time::timeout(Duration::from_secs(2), cdp.call("Browser.close", json!({})))
+            .await;
+        Ok(())
+    }
+
+    async fn browser_cdp(&self) -> Result<Cdp> {
         let version = http_request(self.port, "GET", "/json/version").await?;
         let version: Value = serde_json::from_str(&version).context("/json/version no es JSON")?;
         let ws = version
             .get("webSocketDebuggerUrl")
             .and_then(Value::as_str)
             .context("/json/version sin WebSocket")?;
-        let cdp = Cdp::connect(ws).await?;
-        cdp.call("Browser.close", json!({})).await.ok();
-        Ok(())
+        Cdp::connect(ws).await
     }
 
     fn wait_exit(&mut self, timeout: Duration) {
@@ -403,6 +421,9 @@ impl Drop for Browser {
     fn drop(&mut self) {
         #[cfg(unix)]
         if let Some(pid) = self.child.id() {
+            if self.closing.load(Ordering::Relaxed) {
+                self.wait_exit(Duration::from_secs(2));
+            }
             if matches!(self.child.try_wait(), Ok(Some(_))) {
                 return;
             }
@@ -420,12 +441,21 @@ impl Drop for Browser {
     }
 }
 
+/// El nodo esperado desapareció antes de leer su descriptor.
+#[derive(Debug, thiserror::Error)]
+pub enum ActionUnavailable {
+    #[error("el elemento {selector:?} ya no está en la página")]
+    Missing { selector: String },
+    #[error("no se pudo interpretar el campo «{field}» de la acción")]
+    InvalidField { field: String },
+}
+
 /// Estado de una descarga observada por el navegador.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DownloadEvent {
     pub id: String,
     pub name: String,
-    pub path: PathBuf,
+    pub path: Option<PathBuf>,
     pub state: DownloadState,
 }
 
@@ -586,13 +616,18 @@ impl Chrome {
 
         let value: Value = serde_json::from_str(&text).context("JSON de extracción inválido")?;
         if let Some(error) = value.get("error").and_then(Value::as_str) {
+            if error == "selector_not_found" {
+                return Err(ActionUnavailable::Missing {
+                    selector: selector.into(),
+                }
+                .into());
+            }
             bail!("extracción: {error} (selector {selector:?})");
         }
         let raw: RawAction = serde_path_to_error::deserialize(value).map_err(|error| {
-            anyhow::anyhow!(
-                "no se pudo interpretar el campo «{}» de la acción",
-                error.path()
-            )
+            ActionUnavailable::InvalidField {
+                field: error.path().to_string(),
+            }
         })?;
         Ok(ActionDescriptor::from_raw(raw, provenance, generation))
     }
@@ -880,7 +915,12 @@ impl Chrome {
     /// Ajusta la página al área visible de la shell. `width`/`height` son CSS
     /// píxeles y `scale` el devicePixelRatio: a 2 el texto llega nítido aunque
     /// la textura se dibuje más pequeña.
-    pub async fn set_viewport(&self, width: u32, height: u32, scale: f64) -> Result<()> {
+    pub async fn set_viewport(
+        &self,
+        width: u32,
+        height: u32,
+        scale: f64,
+    ) -> Result<Option<String>> {
         let scale = scale.clamp(1.0, 3.0);
         self.cdp
             .call(
@@ -904,14 +944,20 @@ impl Chrome {
                 }),
             )
             .await?;
-        // El cambio de tamaño puede no generar un frame de screencast si la
-        // página está quieta; una captura fuerza el pintado y el siguiente
-        // frame llega con las medidas nuevas.
-        self.cdp
-            .call("Page.captureScreenshot", json!({ "format": "jpeg" }))
+        // Una página quieta puede no emitir un frame de inmediato tras cambiar
+        // de tamaño. Entrega la captura para actualizar la vista y el puntero.
+        Ok(self
+            .cdp
+            .call(
+                "Page.captureScreenshot",
+                json!({ "format": "jpeg", "quality": 80 }),
+            )
             .await
-            .ok();
-        Ok(())
+            .ok()
+            .and_then(|mut result| match result["data"].take() {
+                Value::String(data) => Some(data),
+                _ => None,
+            }))
     }
 
     /// Navega en el historial de la página. `false` si no hay entrada en esa
@@ -1273,8 +1319,18 @@ impl engine::Transport for Chrome {
         width: u32,
         height: u32,
         scale: f64,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
+    ) -> impl std::future::Future<Output = Result<Option<String>>> + Send {
         Chrome::set_viewport(self, width, height, scale)
+    }
+
+    async fn move_mouse(&self, x: f64, y: f64) -> Result<()> {
+        self.cdp
+            .call(
+                "Input.dispatchMouseEvent",
+                json!({ "type": "mouseMoved", "x": x, "y": y }),
+            )
+            .await?;
+        Ok(())
     }
 
     fn history(&mut self, delta: i64) -> impl std::future::Future<Output = Result<bool>> + Send {
@@ -1293,9 +1349,9 @@ impl engine::Transport for Chrome {
         let expression = format!(
             r#"(() => {{
             if (location.origin !== 'https://www.youtube.com') return null;
-            const button = document.querySelector({selector});
-            const box = button?.closest('yt-searchbox, ytd-searchbox');
-            if (!box || !button.matches('button.ytSearchboxComponentSearchButton, #search-icon-legacy')) return null;
+            const control = document.querySelector({selector});
+            const box = control?.closest('yt-searchbox, ytd-searchbox');
+            if (!box || !control.matches('input[name="search_query"], button.ytSearchboxComponentSearchButton, #search-icon-legacy')) return null;
             const input = box.querySelector('input[name="search_query"]');
             return JSON.stringify(input ? input.value.trim() : null);
         }})()"#

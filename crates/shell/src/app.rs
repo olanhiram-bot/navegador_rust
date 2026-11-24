@@ -35,7 +35,7 @@ struct PendingCard {
 struct DownloadItem {
     id: String,
     name: String,
-    path: PathBuf,
+    path: Option<PathBuf>,
     state: engine_cdp::DownloadState,
     received: u64,
     total: u64,
@@ -426,6 +426,7 @@ impl ShellApp {
                         .find(|item| item.id == download.id)
                     {
                         item.state = download.state;
+                        item.path = download.path.clone();
                         if let engine_cdp::DownloadState::Progress { received, total } =
                             download.state
                         {
@@ -447,7 +448,7 @@ impl ShellApp {
                             format!("descargando «{}»…", download.name)
                         }
                         engine_cdp::DownloadState::Done => {
-                            format!("descarga completa: {}", download.path.display())
+                            format!("descarga completa: {}", download.name)
                         }
                         engine_cdp::DownloadState::Canceled => {
                             format!("descarga cancelada: {}", download.name)
@@ -994,7 +995,7 @@ impl ShellApp {
                             engine_cdp::DownloadState::Started => "empezando…".to_string(),
                             engine_cdp::DownloadState::Progress { received, total } => {
                                 if total > 0 {
-                                    format!("{} %", (received * 100 / total).min(100))
+                                    format!("{} %", (received.saturating_mul(100) / total).min(100))
                                 } else {
                                     "descargando…".to_string()
                                 }
@@ -1002,16 +1003,24 @@ impl ShellApp {
                         };
                         ui.label(egui::RichText::new(&item.name).size(12.0));
                         ui.label(egui::RichText::new(detail).size(11.0).color(MUTED));
-                        if item.state == engine_cdp::DownloadState::Done
+                        if let Some(path) = &item.path
                             && ui.button("Abrir").clicked()
                         {
-                            let _ = webbrowser::open(&item.path.to_string_lossy());
+                            let _ = webbrowser::open(&path.to_string_lossy());
                         }
                         if item.state == engine_cdp::DownloadState::Done
+                            && let Some(dir) = crate::estado::downloads_dir()
                             && ui.button("Carpeta").clicked()
-                            && let Some(dir) = item.path.parent()
                         {
                             let _ = webbrowser::open(&dir.to_string_lossy());
+                        }
+                        if matches!(
+                            item.state,
+                            engine_cdp::DownloadState::Started
+                                | engine_cdp::DownloadState::Progress { .. }
+                        ) && ui.button("Cancelar").clicked()
+                        {
+                            self.handle.cancel_download(item.id.clone());
                         }
                     });
                 }

@@ -713,13 +713,12 @@ fn una_descarga_llega_a_la_carpeta_y_avisa_al_terminar() {
         }
     }
     let download = finished.expect("la descarga debe completarse y avisarse");
-    assert!(
-        download.path.starts_with(&downloads),
-        "debe ir a la carpeta configurada: {:?}",
-        download.path
-    );
+    let saved = downloads.join("informe.txt");
+    if let Some(path) = download.path {
+        assert_eq!(path, saved);
+    }
     assert_eq!(
-        std::fs::read_to_string(&download.path).unwrap().trim(),
+        std::fs::read_to_string(&saved).unwrap().trim(),
         "contenido de prueba"
     );
     handle.shutdown();
@@ -1098,5 +1097,269 @@ fn un_boton_que_solo_ejecuta_javascript_es_interaccion_local() {
             }
         )
     });
+    handle.shutdown();
+}
+
+#[test]
+fn el_arrastre_por_coordenadas_css_conserva_el_texto_a_distintas_escalas() {
+    let _slot = slot();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = spawn(
+        "data:text/html,<title>Seleccion</title><body style='margin:0'><p style='margin:0; font:20px monospace'>seleccion comprobada</p></body>".into(),
+        dir.path().join("recibos.jsonl"),
+    );
+    let tab = match wait_for(&handle, 20, |event| {
+        matches!(event, Event::Selected(Some(_)))
+    }) {
+        Event::Selected(Some(id)) => id,
+        _ => unreachable!(),
+    };
+    for scale in [1.0, 1.25, 2.0] {
+        handle.viewport(768, 576, scale);
+        let event = wait_for(&handle, 20, |event| {
+            matches!(event, Event::Frame { frame, .. }
+                if frame.width == (768.0 * scale) as usize && frame.height == (576.0 * scale) as usize)
+        });
+        let Event::Frame { frame, .. } = event else {
+            unreachable!()
+        };
+        assert!(
+            (frame.css_width - 768.0).abs() < 1.0,
+            "ancho CSS a {scale}: {}",
+            frame.css_width
+        );
+        assert!(
+            (frame.css_height - 576.0).abs() < 1.0,
+            "alto CSS a {scale}: {}",
+            frame.css_height
+        );
+        handle.select_text(tab, [0.0, 12.0], [270.0, 12.0]);
+        handle.copy_text(tab);
+        assert!(
+            matches!(wait_for(&handle, 10, |event| matches!(event, Event::CopyText(..))),
+            Event::CopyText(id, text) if id == tab && text == "seleccion comprobada")
+        );
+    }
+    handle.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelar_una_descarga_lenta_no_interrumpe_otra() {
+    use engine_cdp::{Browser, DownloadState, Profile};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+
+    let _slot = slot();
+    let server = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", server.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in server.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let mut request = [0; 2048];
+                let size = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..size]);
+                let header = if request.starts_with("GET /one ") {
+                    "Content-Disposition: attachment; filename=one.bin\r\nContent-Length: 524288\r\n"
+                } else if request.starts_with("GET /two ") {
+                    "Content-Disposition: attachment; filename=two.bin\r\n"
+                } else {
+                    let body = "<a id='one' href='/one'>Uno</a><br><a id='two' href='/two'>Dos</a>";
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    return;
+                };
+                if write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n{header}Connection: close\r\n\r\n").is_err() {
+                    return;
+                }
+                for _ in 0..32 {
+                    if stream.write_all(&[1; 16384]).is_err() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            });
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let browser = Arc::new(
+        Browser::launch(Profile::ephemeral().unwrap(), false)
+            .await
+            .unwrap(),
+    );
+    let (send, mut events) = tokio::sync::mpsc::unbounded_channel();
+    browser
+        .watch_downloads(
+            dir.path().to_owned(),
+            Arc::new(move |event| {
+                let _ = send.send(event);
+            }),
+        )
+        .await
+        .unwrap();
+    let page = browser.new_page().await.unwrap();
+    let mut chrome = engine_cdp::Chrome::attach_existing(browser.clone(), page)
+        .await
+        .unwrap();
+    chrome.navigate(&base).await.unwrap();
+    let snapshot = chrome.snapshot(1).await.unwrap();
+    for element in snapshot
+        .elements
+        .iter()
+        .filter(|element| element.role == "link")
+    {
+        chrome.click_at(element.x, element.y).await.unwrap();
+    }
+    let mut canceled = false;
+    let mut finished = false;
+    let mut unknown_progress = false;
+    let mut requested_cancel = false;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !(canceled && finished) {
+            let event = events.recv().await.unwrap();
+            match (event.name.as_str(), event.state) {
+                ("one.bin", DownloadState::Progress { received, total })
+                    if received > 0 && received < total && !requested_cancel =>
+                {
+                    browser.cancel_download(&event.id).await.unwrap();
+                    requested_cancel = true;
+                }
+                ("one.bin", DownloadState::Canceled) => {
+                    assert!(event.path.is_none());
+                    canceled = true;
+                }
+                ("two.bin", DownloadState::Progress { received, total: 0 }) if received > 0 => {
+                    unknown_progress = true;
+                }
+                ("two.bin", DownloadState::Done) => finished = true,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("una descarga cancelada y otra terminada");
+    assert!(
+        unknown_progress,
+        "debe llegar progreso aunque falte Content-Length"
+    );
+    assert!(!dir.path().join("one.bin").exists());
+    assert_eq!(
+        std::fs::metadata(dir.path().join("two.bin")).unwrap().len(),
+        524288
+    );
+}
+
+#[test]
+fn una_aprobacion_caducada_permite_volver_a_revisar_el_formulario() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    let _slot = slot();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let changed = Arc::new(AtomicBool::new(false));
+    let server = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", server.local_addr().unwrap());
+    let server_requests = requests.clone();
+    let server_changed = changed.clone();
+    std::thread::spawn(move || {
+        for mut stream in server.incoming().flatten() {
+            let mut bytes = [0; 4096];
+            let size = stream.read(&mut bytes).unwrap_or(0);
+            let request = String::from_utf8_lossy(&bytes[..size]);
+            let body = if request.starts_with("GET /changed ") {
+                if server_changed.load(Ordering::SeqCst) {
+                    "yes"
+                } else {
+                    "no"
+                }
+            } else if request.starts_with("POST /submit ") {
+                server_requests.lock().unwrap().push(request.to_string());
+                "<title>Enviado</title>"
+            } else {
+                r#"<form action="/submit" method="post">
+                  <input name="nombre" value="primero">
+                  <button id="aceptar">Confirmar</button></form>
+                  <script>const poll = setInterval(async () => {
+                    if (await (await fetch('/changed', {cache:'no-store'})).text() !== 'yes') return;
+                    document.querySelector('input').value = 'vigente';
+                    document.querySelector('button').textContent = 'Confirmar cambio';
+                    document.body.dataset.changed = 'yes';
+                    clearInterval(poll);
+                  }, 50)</script>"#
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let handle = spawn(base, dir.path().join("log.jsonl"));
+    let (_, elements) = first_snapshot(&handle);
+    let button = elements
+        .iter()
+        .find(|element| element.role == "button")
+        .unwrap();
+    let approve_card = |x, y| {
+        handle.click(x, y);
+        match wait_for(&handle, 10, |event| {
+            matches!(
+                event,
+                Event::Act {
+                    outcome: ActOutcome::ApprovalRequired { .. },
+                    ..
+                }
+            )
+        }) {
+            Event::Act {
+                outcome: ActOutcome::ApprovalRequired { hash, .. },
+                ..
+            } => hash,
+            _ => unreachable!(),
+        }
+    };
+
+    let first = approve_card(button.x, button.y);
+    changed.store(true, Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(300));
+    handle.approve(first);
+    wait_for(
+        &handle,
+        10,
+        |event| matches!(event, Event::Notice(msg) if msg.starts_with("La página cambió")),
+    );
+    assert!(requests.lock().unwrap().is_empty());
+
+    let _ = approve_card(button.x, button.y);
+    handle.deny();
+    wait_for(
+        &handle,
+        10,
+        |event| matches!(event, Event::Notice(msg) if msg.starts_with("acción denegada")),
+    );
+    assert!(requests.lock().unwrap().is_empty());
+
+    handle.approve(approve_card(button.x, button.y));
+    wait_for(&handle, 10, |event| {
+        matches!(
+            event,
+            Event::Act {
+                outcome: ActOutcome::Executed { .. },
+                ..
+            }
+        )
+    });
+    let seen = requests.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].contains("nombre=vigente"));
     handle.shutdown();
 }

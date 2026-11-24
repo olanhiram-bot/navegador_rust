@@ -54,7 +54,7 @@ function (selector, nameOf) {
     verb = 'navigate';
   } else if (form) {
     if (tag === 'BUTTON' && (type === '' || type === 'submit')) verb = 'submit';
-    if (tag === 'INPUT' && type === 'submit') verb = 'submit';
+    if (tag === 'INPUT' && (type === 'submit' || type === 'image')) verb = 'submit';
   }
 
   const findKey = (re) => Object.keys(fields).find((key) => re.test(key));

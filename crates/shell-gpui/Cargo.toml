@@ -9,6 +9,7 @@ name = "navegador-gpui"
 path = "src/main.rs"
 
 [dependencies]
+async-channel = "2"
 anyhow.workspace = true
 card = { path = "../card" }
 engine-cdp = { path = "../engine-cdp" }

@@ -6,5 +6,5 @@
 mod cdp;
 mod chrome;
 
-pub use chrome::{Browser, Chrome, DownloadEvent, DownloadState, Page, Profile};
+pub use chrome::{ActionUnavailable, Browser, Chrome, DownloadEvent, DownloadState, Page, Profile};
 pub use engine::{DispatchOutcome, ElementRef, Engine, FindResult, Snapshot};

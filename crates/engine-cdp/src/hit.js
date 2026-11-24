@@ -2,10 +2,12 @@ function (x, y) {
   const el = document.elementFromPoint(x, y);
   if (!el) return JSON.stringify({ selector: null });
 
-  const target =
-    el.closest(
-      'a[href], button, input, select, textarea, summary, [role=button], [onclick]'
-    ) || el;
+  let target = el.closest(
+    'a[href], button, input, select, textarea, summary, [role=button], ' +
+    '[role=link], [onclick], [contenteditable]:not([contenteditable=false]), video, label'
+  );
+  if (target?.tagName === 'LABEL') target = target.control;
+  if (!target) return JSON.stringify({ selector: null });
 
   // Mismo cssPath que snapshot.js: la ref solo vale si el selector coincide
   // exactamente con el del snapshot.

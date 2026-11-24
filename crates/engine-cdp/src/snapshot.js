@@ -50,7 +50,8 @@ function (nameOf) {
     const type = (el.getAttribute('type') || '').toLowerCase();
     if (tag === 'a') return 'link';
     if (tag === 'select') return 'select';
-    if (tag === 'textarea') return 'textbox';
+    if (tag === 'textarea' || el.isContentEditable) return 'textbox';
+    if (tag === 'video') return 'video';
     if (tag === 'summary') return 'button';
     if (tag === 'button') return 'button';
     if (tag === 'input') {
@@ -72,7 +73,7 @@ function (nameOf) {
 
   const candidates = document.querySelectorAll(
     'a[href], button, input:not([type=hidden]), select, textarea, summary, ' +
-      '[role=button], [role=link], [onclick]'
+      '[role=button], [role=link], [onclick], [contenteditable]:not([contenteditable=false]), video'
   );
 
   const elements = [];

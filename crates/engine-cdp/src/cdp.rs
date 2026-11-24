@@ -28,7 +28,7 @@ struct Inner {
 pub struct Cdp {
     inner: std::sync::Arc<Inner>,
     events: mpsc::UnboundedReceiver<Value>,
-    _reader: tokio::task::JoinHandle<()>,
+    reader: tokio::task::JoinHandle<()>,
 }
 
 impl Cdp {
@@ -83,12 +83,13 @@ impl Cdp {
                     }
                 }
             }
+            reader_inner.pending.lock().unwrap().clear();
         });
 
         Ok(Cdp {
             inner,
             events,
-            _reader: reader,
+            reader,
         })
     }
 
@@ -116,6 +117,10 @@ impl Cdp {
         Ok(response.get("result").cloned().unwrap_or(Value::Null))
     }
 
+    pub async fn recv_event(&mut self) -> Option<Value> {
+        self.events.recv().await
+    }
+
     /// Espera el siguiente evento. `None` si la conexión terminó.
     pub async fn next_event(&mut self, timeout: Duration) -> Result<Option<Value>> {
         if timeout.is_zero() {
@@ -126,5 +131,11 @@ impl Cdp {
             Ok(None) => Ok(None),
             Err(_) => Ok(None),
         }
+    }
+}
+
+impl Drop for Cdp {
+    fn drop(&mut self) {
+        self.reader.abort();
     }
 }
